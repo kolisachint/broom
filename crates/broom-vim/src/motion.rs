@@ -175,7 +175,7 @@ fn repeat(n: usize, start: Cursor, step: impl Fn(Cursor) -> Cursor) -> Cursor {
 
 // Word class: 0 blank (also the line end), 1 word char, 2 punctuation.
 // With `big`, every non-blank is class 1.
-fn char_class(c: char, big: bool) -> u8 {
+pub(crate) fn char_class(c: char, big: bool) -> u8 {
     if c.is_whitespace() {
         0
     } else if big || c.is_alphanumeric() || c == '_' {
