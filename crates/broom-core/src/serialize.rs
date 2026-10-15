@@ -139,94 +139,132 @@ fn cell_md(cell: &[Run]) -> String {
     inline_md(cell).replace('|', "\\|")
 }
 
-/// Inline markdown for a list of runs.
+/// An open inline span. Outermost first: link, strike, bold, italic.
+#[derive(Clone, Debug, PartialEq)]
+enum Span {
+    Link(String),
+    Strike,
+    Bold,
+    Italic,
+}
+
+/// What a piece of inline output is.
+enum Md {
+    /// Visible text, escaped on output.
+    Text(String),
+    /// Markdown already written (code span, math, wikilink).
+    Raw(String),
+}
+
+/// Inline markdown for a list of runs. Spans are nested: a span stays open
+/// across neighbours that share it, so `~~a~~` + `~~**b**~~` becomes `~~a**b**~~`.
 pub(crate) fn inline_md(runs: &[Run]) -> String {
     let mut out = String::new();
     let mut line_start = true;
+    let mut open: Vec<Span> = Vec::new();
     for run in runs {
-        let s = &run.style;
-        if let Some(w) = &s.wikilink {
-            let shown = &run.text;
-            if *shown == w.target {
-                out.push_str(&format!("[[{}]]", w.target));
-            } else {
-                out.push_str(&format!("[[{}|{}]]", w.target, shown));
-            }
-            line_start = false;
-        } else if s.math {
-            out.push_str(&format!("${}$", run.text));
-            line_start = false;
-        } else if s.code {
-            let longest = run.text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-            let fence = "`".repeat(longest + 1);
-            let pad = if run.text.starts_with('`') || run.text.ends_with('`') {
-                " "
-            } else {
-                ""
-            };
-            out.push_str(&format!("{fence}{pad}{}{pad}{fence}", run.text));
-            line_start = false;
-        } else if !has_style(s) {
-            out.push_str(&escape_plain(&run.text, &mut line_start));
-        } else {
-            styled_md(&mut out, run, &mut line_start);
+        for (md, want) in pieces(run) {
+            emit(&mut out, &mut open, &mut line_start, &want, md);
         }
+    }
+    emit(&mut out, &mut open, &mut line_start, &[], Md::Text(String::new()));
+    out
+}
+
+/// Splits a run into pieces with the spans they need. Spaces at the edges of
+/// a styled run are plain, so no delimiter is left next to a space.
+fn pieces(run: &Run) -> Vec<(Md, Vec<Span>)> {
+    let s = &run.style;
+    if let Some(w) = &s.wikilink {
+        let md = if run.text == w.target {
+            format!("[[{}]]", w.target)
+        } else {
+            format!("[[{}|{}]]", w.target, run.text)
+        };
+        return vec![(Md::Raw(md), Vec::new())];
+    }
+    if s.math {
+        return vec![(Md::Raw(format!("${}$", run.text)), Vec::new())];
+    }
+    if s.code {
+        let longest = run.text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(longest + 1);
+        let pad = if run.text.starts_with('`') || run.text.ends_with('`') {
+            " "
+        } else {
+            ""
+        };
+        let md = format!("{fence}{pad}{}{pad}{fence}", run.text);
+        return vec![(Md::Raw(md), Vec::new())];
+    }
+    let want = spans_of(s);
+    if want.is_empty() {
+        return vec![(Md::Text(run.text.clone()), Vec::new())];
+    }
+    let core = run.text.trim_matches(' ');
+    if core.is_empty() {
+        return vec![(Md::Text(run.text.clone()), Vec::new())];
+    }
+    let lead = &run.text[..run.text.len() - run.text.trim_start_matches(' ').len()];
+    let trail = &run.text[run.text.trim_end_matches(' ').len()..];
+    let mut out = Vec::new();
+    if !lead.is_empty() {
+        out.push((Md::Text(lead.to_string()), Vec::new()));
+    }
+    out.push((Md::Text(core.to_string()), want));
+    if !trail.is_empty() {
+        out.push((Md::Text(trail.to_string()), Vec::new()));
     }
     out
 }
 
-fn has_style(s: &Style) -> bool {
-    s.bold || s.italic || s.strike || s.link.is_some()
+fn spans_of(s: &Style) -> Vec<Span> {
+    let mut v = Vec::new();
+    if let Some(url) = &s.link {
+        v.push(Span::Link(url.clone()));
+    }
+    if s.strike {
+        v.push(Span::Strike);
+    }
+    if s.bold {
+        v.push(Span::Bold);
+    }
+    if s.italic {
+        v.push(Span::Italic);
+    }
+    v
 }
 
-/// Bold, italic, strike and link. Spaces at the edges go outside the delimiters.
-fn styled_md(out: &mut String, run: &Run, line_start: &mut bool) {
-    let s = &run.style;
-    let text = run.text.as_str();
-    let core = text.trim_matches(' ');
-    if core.is_empty() {
-        out.push_str(&escape_plain(text, line_start));
-        return;
+/// Closes spans that `want` does not keep, opens the new ones, then writes `md`.
+fn emit(out: &mut String, open: &mut Vec<Span>, line_start: &mut bool, want: &[Span], md: Md) {
+    let common = open.iter().zip(want).take_while(|(a, b)| a == b).count();
+    let closing = open.split_off(common);
+    for sp in closing.iter().rev() {
+        out.push_str(&match sp {
+            Span::Link(url) => format!("]({})", link_dest(url)),
+            Span::Strike => "~~".to_string(),
+            Span::Bold => "**".to_string(),
+            Span::Italic => "*".to_string(),
+        });
+        *line_start = false;
     }
-    let lead = &text[..text.len() - text.trim_start_matches(' ').len()];
-    let trail = &text[text.trim_end_matches(' ').len()..];
-    out.push_str(&escape_plain(lead, line_start));
-
-    let mut open = String::new();
-    let mut close = String::new();
-    if s.link.is_some() {
-        open.push('[');
+    for sp in &want[common..] {
+        out.push_str(match sp {
+            Span::Link(_) => "[",
+            Span::Strike => "~~",
+            Span::Bold => "**",
+            Span::Italic => "*",
+        });
+        *line_start = false;
+        open.push(sp.clone());
     }
-    if s.strike {
-        open.push_str("~~");
+    match md {
+        Md::Text(t) => out.push_str(&escape_plain(&t, line_start)),
+        Md::Raw(s) => {
+            out.push_str(&s);
+            *line_start = false;
+        }
     }
-    if s.bold {
-        open.push_str("**");
-    }
-    if s.italic {
-        open.push('*');
-    }
-    let mut tail = String::new();
-    if s.italic {
-        tail.push('*');
-    }
-    if s.bold {
-        tail.push_str("**");
-    }
-    if s.strike {
-        tail.push_str("~~");
-    }
-    close.push_str(&tail);
-    if let Some(url) = &s.link {
-        close.push_str(&format!("]({})", link_dest(url)));
-    }
-
-    out.push_str(&open);
-    *line_start = false;
-    out.push_str(&escape_plain(core, &mut false));
-    out.push_str(&close);
-    *line_start = false;
-    out.push_str(&escape_plain(trail, line_start));
 }
 
 fn link_dest(url: &str) -> String {
@@ -248,6 +286,14 @@ fn escape_plain(text: &str, line_start: &mut bool) -> String {
         *line_start = c == '\n' || (c == ' ' && at_start);
         if c == '\n' {
             out.push('\n');
+            continue;
+        }
+        if at_start && c == ' ' {
+            out.push_str("&#32;");
+            continue;
+        }
+        if at_start && c == '\t' {
+            out.push_str("&#9;");
             continue;
         }
         if at_start && c.is_ascii_digit() && number_end.is_none() {
@@ -305,5 +351,26 @@ mod tests {
             },
         };
         assert_eq!(inline_md(&[plain("a "), bold]), "a **x**");
+    }
+
+    #[test]
+    fn adjacent_styled_runs_share_spans() {
+        let st = |bold: bool, strike: bool| Style {
+            bold,
+            strike,
+            ..Style::default()
+        };
+        let runs = vec![
+            Run { text: "a".into(), style: st(false, true) },
+            Run { text: "b".into(), style: st(true, true) },
+            Run { text: " c".into(), style: st(false, false) },
+        ];
+        assert_eq!(inline_md(&runs), "~~a**b**~~ c");
+        let doc = crate::Document::parse(&inline_md(&runs));
+        let BlockKind::Paragraph { content } = doc.block(0).unwrap().kind() else {
+            panic!("paragraph");
+        };
+        assert_eq!(content[0].style, st(false, true));
+        assert_eq!(content[1].style, st(true, true));
     }
 }

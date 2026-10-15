@@ -53,10 +53,19 @@ impl Document {
         Ok(())
     }
 
-    /// Re-serializes block `i` after its kind changed.
+    /// Re-serializes block `i` after its kind changed. The result is re-parsed:
+    /// if it reads back differently, the block is written as plain escaped text.
     pub(crate) fn sync(&mut self, i: usize) {
         let b = &mut self.blocks[i];
-        b.source = reserialize(&b.source, &b.kind);
+        let mut source = reserialize(&b.source, &b.kind);
+        if !reads_back(&b.kind, &source) {
+            let plain = strip_styles(&b.kind);
+            source = reserialize(&b.source, &plain);
+            if reads_back(&plain, &source) {
+                b.kind = plain;
+            }
+        }
+        b.source = source;
         b.edited = true;
     }
 
@@ -326,3 +335,29 @@ impl Document {
     }
 }
 
+
+/// Whether `source` parses back to one block with the same kind and visible text.
+fn reads_back(kind: &BlockKind, source: &str) -> bool {
+    let parsed = crate::parse::parse_blocks(source);
+    match parsed.as_slice() {
+        [one] => {
+            std::mem::discriminant(&one.kind) == std::mem::discriminant(kind)
+                && one.kind.visible_text() == kind.visible_text()
+        }
+        _ => false,
+    }
+}
+
+/// The same block with every run made plain (wikilinks, math and code too).
+fn strip_styles(kind: &BlockKind) -> BlockKind {
+    let mut copy = kind.clone();
+    for slot in slots::slots_mut(&mut copy) {
+        if let slots::SlotMut::Runs(runs) = slot {
+            for r in runs.iter_mut() {
+                r.style = crate::inline::Style::default();
+            }
+            runs::normalize(runs);
+        }
+    }
+    copy
+}
