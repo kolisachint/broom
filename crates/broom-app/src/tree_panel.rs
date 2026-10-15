@@ -6,6 +6,7 @@
 //! New and rename use a one-line inline input. Delete asks for `y`.
 
 use std::fs::{self, OpenOptions};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use broom_config::VimBindings;
@@ -48,6 +49,30 @@ enum NameKind {
 struct Naming {
     kind: NameKind,
     buf: String,
+}
+
+/// Why a new or renamed entry name is refused. `None` when the name is fine.
+/// A name is one path component: no `/`, and not `.` or `..`.
+pub fn name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("name is empty")
+    } else if name.contains('/') {
+        Some("name cannot contain /")
+    } else if name == "." || name == ".." {
+        Some("name cannot be . or ..")
+    } else {
+        None
+    }
+}
+
+/// True when `to` already exists as a different file. A case-only rename of
+/// `from` on a case-insensitive disk is not a clash: both names are the same file.
+fn target_taken(from: &Path, to: &Path) -> bool {
+    match (fs::metadata(from), fs::metadata(to)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) != (b.dev(), b.ino()),
+        (Err(_), Ok(_)) => true,
+        (_, Err(_)) => false,
+    }
 }
 
 pub struct TreeView {
@@ -258,9 +283,28 @@ impl TreeView {
     }
 
     pub fn begin_delete(&mut self, cx: &mut Context<Self>) {
-        self.pending_delete = self.selected.clone();
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        if self.has_unsaved(&path, cx) {
+            return;
+        }
+        self.pending_delete = Some(path);
         self.message = None;
         cx.notify();
+    }
+
+    /// True (and a message is set) when an open tab under `path` has unsaved edits.
+    fn has_unsaved(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
+        if !self.tabs.read(cx).has_dirty_under(path, cx) {
+            return false;
+        }
+        self.fail(
+            "cannot delete",
+            "it has unsaved changes open. Save or close its tab first",
+        );
+        cx.notify();
+        true
     }
 
     fn commit_naming(&mut self, cx: &mut Context<Self>) {
@@ -275,7 +319,13 @@ impl TreeView {
         match naming.kind {
             NameKind::New { dir } => {
                 let is_dir = name.ends_with('/');
-                let path = dir.join(name.trim_end_matches('/'));
+                let bare = name.trim_end_matches('/');
+                if let Some(problem) = name_problem(bare) {
+                    self.fail("cannot create", problem);
+                    cx.notify();
+                    return;
+                }
+                let path = dir.join(bare);
                 let result = if is_dir {
                     fs::create_dir(&path)
                 } else {
@@ -298,14 +348,20 @@ impl TreeView {
                     return;
                 };
                 let to = parent.join(&name);
-                match fs::rename(&from, &to) {
-                    Ok(()) => {
-                        self.tabs
-                            .update(cx, |tabs, cx| tabs.path_renamed(&from, &to, cx));
-                        self.invalidate(&parent);
-                        self.selected = Some(to);
+                if let Some(problem) = name_problem(&name) {
+                    self.fail("cannot rename", problem);
+                } else if target_taken(&from, &to) {
+                    self.fail("cannot rename", "a file with that name already exists");
+                } else {
+                    match fs::rename(&from, &to) {
+                        Ok(()) => {
+                            self.tabs
+                                .update(cx, |tabs, cx| tabs.path_renamed(&from, &to, cx));
+                            self.invalidate(&parent);
+                            self.selected = Some(to);
+                        }
+                        Err(e) => self.fail("cannot rename", e),
                     }
-                    Err(e) => self.fail("cannot rename", e),
                 }
             }
         }
@@ -316,6 +372,9 @@ impl TreeView {
         let Some(path) = self.pending_delete.take() else {
             return;
         };
+        if self.has_unsaved(&path, cx) {
+            return;
+        }
         let result = if path.is_dir() {
             fs::remove_dir_all(&path)
         } else {
