@@ -701,6 +701,7 @@ mod edit_tests {
 #[cfg(test)]
 mod fuzz_tests {
     use super::*;
+    use crate::block::BlockKind;
     use crate::edit::StyleFlag;
     use crate::pos::DocRange;
 
@@ -719,18 +720,44 @@ mod fuzz_tests {
         DocPos::new(block, rng.next(len + 1))
     }
 
-    #[test]
-    fn random_edits_never_panic_and_keep_invariants() {
-        const CHARS: &[&str] = &["a", "b", " ", "*", "_", "`", "~", "[", "]", "#", "-", ">", "1.", "\n", "|", "$", "\\", "é"];
+    /// What a reader sees: per block, visible text and block kind.
+    fn semantics(doc: &Document) -> Vec<(String, std::mem::Discriminant<BlockKind>)> {
+        doc.blocks()
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                (
+                    doc.visible_text(i).unwrap_or_default(),
+                    std::mem::discriminant(b.kind()),
+                )
+            })
+            .collect()
+    }
+
+    /// Property: re-parsing the saved markdown gives the same visible text and kinds.
+    pub(crate) fn assert_reparse_matches(doc: &Document) {
+        let reparsed = Document::parse(&doc.to_markdown());
+        assert_eq!(
+            semantics(doc),
+            semantics(&reparsed),
+            "reparse differs for markdown {:?}",
+            doc.to_markdown()
+        );
+    }
+
+    /// Runs `ops` random edits from each seed. With `check`, every step is
+    /// verified by [`assert_reparse_matches`].
+    pub(crate) fn random_sessions(runs: u64, steps: usize, check: bool) {
+        const CHARS: &[&str] = &["a", "b", " ", "*", "_", "`", "~", "[", "]", "#", "-", ">", "1.", "\n", "|", "$", "\\", "é", "\t"];
         let seeds = [
             "# Title\n\nPara with **bold** and [[Note|x]].\n\n- a\n- [ ] b\n  - c\n\n> q\n> r\n\n```\ncode\n```\n\n| h | i |\n|---|:-:|\n| 1 | 2 |\n\n---\n\n$$\nx\n$$\n\n<div>raw</div>\n",
             "plain\n",
         ];
         for (si, seed) in seeds.iter().enumerate() {
-            for run in 0..40u64 {
+            for run in 0..runs {
                 let mut rng = Lcg(run * 7919 + si as u64 + 1);
                 let mut doc = Document::parse(seed);
-                for _ in 0..150 {
+                for _ in 0..steps {
                     match rng.next(12) {
                         0..=3 => {
                             let pos = random_pos(&doc, &mut rng);
@@ -781,6 +808,9 @@ mod fuzz_tests {
                         }
                     }
                     check_invariants(&doc);
+                    if check {
+                        assert_reparse_matches(&doc);
+                    }
                 }
                 // Re-parsing whatever we serialized must not panic either.
                 let _ = Document::parse(&doc.to_markdown());
@@ -788,16 +818,24 @@ mod fuzz_tests {
         }
     }
 
+    #[test]
+    fn random_edits_never_panic_and_keep_invariants() {
+        random_sessions(40, 150, false);
+    }
+
+    /// Safety net for every edit: the saved markdown must read back the same.
+    #[test]
+    #[ignore = "property: enable once the reparse blockers are fixed"]
+    fn reparse_matches_after_random_edits() {
+        random_sessions(40, 150, true);
+    }
+
     fn check_invariants(doc: &Document) {
         let joined: String = doc.blocks().iter().map(|b| b.source()).collect();
         assert_eq!(doc.to_markdown(), joined);
-        for (i, b) in doc.blocks().iter().enumerate() {
-            if let Some(len) = doc.visible_len(i) {
-                // Every offset up to the end must map to a line and back.
-                let pos = DocPos::new(i, len);
-                assert!(doc.pos_to_line(pos).is_some(), "block {i} end");
-            }
-            let _ = b;
+        for i in 0..doc.block_count() {
+            let len = doc.visible_len(i).unwrap_or(0);
+            assert!(doc.pos_to_line(DocPos::new(i, len)).is_some(), "block {i} end");
         }
         assert!(doc.line_count() >= 1);
     }
