@@ -7,8 +7,17 @@ use crate::inline::{Run, Style};
 /// of `old_source`, so the block still joins the next one the same way.
 pub(crate) fn reserialize(old_source: &str, kind: &BlockKind) -> String {
     let body = kind_md(kind);
-    let trailing = &old_source[old_source.trim_end().len()..];
-    format!("{body}{trailing}")
+    format!("{body}{}", trailing_of(old_source))
+}
+
+/// The blank-line separator at the end of a block source: everything from the
+/// first newline after the last non-space char. Spaces before that are content.
+pub(crate) fn trailing_of(source: &str) -> &str {
+    let body_end = source.trim_end().len();
+    match source[body_end..].find('\n') {
+        Some(i) => &source[body_end + i..],
+        None => "",
+    }
 }
 
 /// Markdown for one block kind, without its trailing separator.
@@ -22,8 +31,6 @@ pub(crate) fn kind_md(kind: &BlockKind) -> String {
                 text.push_str("\\#");
             }
             format!("{} {}", "#".repeat(*level as usize), text)
-                .trim_end()
-                .to_string()
         }
         BlockKind::List { ordered, items } => list_md(*ordered, items),
         BlockKind::TaskList { items } => list_md(false, items),

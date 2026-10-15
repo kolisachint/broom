@@ -109,6 +109,14 @@ pub(crate) fn slice(runs: &[Run], from: usize, to: usize) -> Vec<Run> {
     out
 }
 
+/// Replaces chars `from..to` with one run.
+pub(crate) fn replace_with(runs: &mut Vec<Run>, from: usize, to: usize, new: Run) {
+    let i = boundary(runs, from);
+    let j = boundary(runs, to);
+    runs.splice(i..j, [new]);
+    normalize(runs);
+}
+
 /// Applies `f` to the style of every char in `from..to`.
 pub(crate) fn map_style(runs: &mut Vec<Run>, from: usize, to: usize, f: impl Fn(&mut Style)) {
     if from >= to {

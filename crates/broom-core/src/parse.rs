@@ -485,7 +485,7 @@ fn split_wikilinks(run: Run) -> Vec<Run> {
 }
 
 /// Parses the inside of `[[...]]`. Links do not span lines and cannot nest.
-fn parse_wikitarget(inner: &str) -> Option<WikiTarget> {
+pub(crate) fn parse_wikitarget(inner: &str) -> Option<WikiTarget> {
     if inner.contains(['\n', '[', ']']) {
         return None;
     }

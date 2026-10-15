@@ -27,8 +27,10 @@ pub mod inline;
 pub mod input_rules;
 pub mod pos;
 
+mod ops;
 mod parse;
 mod runs;
+mod slots;
 mod serialize;
 mod undo;
 
