@@ -97,22 +97,63 @@ fn binding(b: &Binding) -> KeyBinding {
     KeyBinding::new(&keys, Run(b.command), context_of(b.context))
 }
 
-/// GPUI keystroke text for one chord, e.g. `cmd-shift-p`.
+/// GPUI keystroke text for one chord, e.g. `cmd-shift-p`. Uses the form macOS
+/// reports (see [`macos_key`]), so the binding matches the key that arrives.
 fn chord_text(c: &Chord) -> String {
+    let (shift, key) = macos_key(c);
     let mut out = String::new();
     for (on, name) in [
         (c.ctrl, "ctrl-"),
         (c.alt, "alt-"),
-        (c.shift, "shift-"),
+        (shift, "shift-"),
         (c.cmd, "cmd-"),
     ] {
         if on {
             out.push_str(name);
         }
     }
-    out.push_str(&c.key);
+    out.push_str(&key);
     out
 }
+
+/// The shift flag and key that macOS reports for a chord. For shifted
+/// punctuation and digits macOS sends the shifted character with Shift
+/// cleared: Cmd+Shift+1 arrives as `cmd-!`, Ctrl+Shift+/ as `ctrl-?`.
+/// Shifted letters keep Shift and the lowercase key (`cmd-shift-p`).
+fn macos_key(c: &Chord) -> (bool, String) {
+    let mut chars = c.key.chars();
+    if let (true, Some(base), None) = (c.shift, chars.next(), chars.next())
+        && let Some((_, shifted)) = US_SHIFTED.iter().find(|(b, _)| *b == base)
+    {
+        return (false, shifted.to_string());
+    }
+    (c.shift, c.key.clone())
+}
+
+/// Unshifted key and the character Shift makes on a US layout.
+const US_SHIFTED: &[(char, char)] = &[
+    ('1', '!'),
+    ('2', '@'),
+    ('3', '#'),
+    ('4', '$'),
+    ('5', '%'),
+    ('6', '^'),
+    ('7', '&'),
+    ('8', '*'),
+    ('9', '('),
+    ('0', ')'),
+    ('-', '_'),
+    ('=', '+'),
+    ('[', '{'),
+    (']', '}'),
+    (';', ':'),
+    ('\'', '"'),
+    (',', '<'),
+    ('.', '>'),
+    ('/', '?'),
+    ('`', '~'),
+    ('\\', '|'),
+];
 
 /// Context predicate for a keymap scope. Global keys stay out of text
 /// fields, so Cmd+B does nothing in a rename box.
@@ -242,22 +283,25 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{chord_text, context_of, Run};
+    use super::{chord_text, context_of, macos_key, Run};
     use broom_config::{Chord, Keymap};
     use gpui_kit::{KeyBinding, Keystroke, Modifiers};
 
     /// The keystroke macOS reports for a chord: `key` is the unmodified key
     /// (lowercase letter, or the punctuation on the key), Shift and Cmd as flags.
     fn mac_keystroke(c: &Chord) -> Keystroke {
+        // Same rule as gpui-pre-macos parse_keystroke: shifted punctuation and
+        // digits arrive as the shifted character with Shift cleared.
+        let (shift, key) = macos_key(c);
         Keystroke {
             modifiers: Modifiers {
                 control: c.ctrl,
                 alt: c.alt,
-                shift: c.shift,
+                shift,
                 platform: c.cmd,
                 function: false,
             },
-            key: c.key.clone(),
+            key,
             key_char: None,
         }
     }
@@ -301,6 +345,8 @@ mod tests {
         assert_eq!(chord_text(&cmd_slash), "cmd-/");
         assert_eq!(chord_text(&cmd_eq), "cmd-=");
         assert_eq!(chord_text(&cmd_shift_p), "shift-cmd-p");
+        assert_eq!(chord_text(&Chord::parse("ctrl+shift+/").unwrap()), "ctrl-?");
+        assert_eq!(chord_text(&Chord::parse("cmd+shift+1").unwrap()), "cmd-!");
         let typed = mac_keystroke(&cmd_shift_p);
         assert_eq!(typed.key, "p");
         assert!(typed.modifiers.shift && typed.modifiers.platform);
