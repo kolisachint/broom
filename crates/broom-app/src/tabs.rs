@@ -174,7 +174,12 @@ impl Tabs {
     }
 
     /// Builds an editor over `text`. Large files open in source mode.
-    fn new_editor(&self, text: &str, large: bool, cx: &mut Context<Self>) -> Option<Entity<Editor>> {
+    fn new_editor(
+        &self,
+        text: &str,
+        large: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Editor>> {
         let cfg = self.config.clone();
         let editor = guarded("editor", || {
             let mut ed = Editor::new(Document::parse(text), cfg.style.clone(), large, &cfg.vim);
@@ -217,7 +222,9 @@ impl Tabs {
     }
 
     fn index_of_path(&self, path: &Path) -> Option<usize> {
-        self.tabs.iter().position(|t| t.path.as_deref() == Some(path))
+        self.tabs
+            .iter()
+            .position(|t| t.path.as_deref() == Some(path))
     }
 
     fn index_of(&self, id: u64) -> Option<usize> {
@@ -539,7 +546,8 @@ pub fn autosave_ids(tabs: &[(u64, Option<PathBuf>, bool)], due: &[PathBuf]) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::autosave_ids;
+    use std::path::PathBuf;
 
     #[test]
     fn autosave_picks_only_dirty_due_tabs() {

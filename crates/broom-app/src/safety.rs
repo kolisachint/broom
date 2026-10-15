@@ -52,7 +52,10 @@ impl Safety {
         let conflicts = guarded("conflict check", ConflictDetector::new);
         let recovery = recovery_dir
             .and_then(|dir| guarded("recovery", || Recovery::new(dir)))
-            .and_then(|r| r.map_err(|e| eprintln!("broom: recovery unavailable: {e}")).ok());
+            .and_then(|r| {
+                r.map_err(|e| eprintln!("broom: recovery unavailable: {e}"))
+                    .ok()
+            });
         let (watcher, events) = guarded("file watcher", Watcher::new)
             .and_then(Result::ok)
             .map_or((None, None), |(w, rx)| (Some(w), Some(rx)));

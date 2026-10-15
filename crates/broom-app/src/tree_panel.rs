@@ -654,3 +654,19 @@ pub fn install(ws: &mut Workspace, cx: &mut Context<Workspace>) {
     ws.tree = Some(tree);
     ws.tabs = Some(tabs);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::name_problem;
+
+    #[test]
+    fn names_must_be_one_component() {
+        assert_eq!(name_problem(""), Some("name is empty"));
+        assert!(name_problem("a/b.md").is_some());
+        assert!(name_problem(".").is_some());
+        assert!(name_problem("..").is_some());
+        assert_eq!(name_problem("notes.md"), None);
+        assert_eq!(name_problem(".hidden"), None);
+        assert_eq!(name_problem("..notes"), None);
+    }
+}

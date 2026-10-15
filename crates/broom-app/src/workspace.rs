@@ -25,7 +25,7 @@ use broom_links::LinkIndex;
 use gpui_kit::*;
 
 use crate::dialogs::{Dialog, DialogEvent, DialogKind};
-use crate::editor::{Editor, EditorEvent, EditorStyle, ViewMode};
+use crate::editor::{Editor, EditorStyle, ViewMode};
 use crate::keys::Run;
 use crate::right_panel::{RightPanel, RightPanelEvent, backlink_rows};
 use crate::safety::{Safety, read_stamped};
@@ -340,7 +340,9 @@ impl Workspace {
             return false;
         }
         let md = editor.read(cx).markdown();
-        match guarded("save", || broom_fs::write_atomic_stamped(path, md.as_bytes())) {
+        match guarded("save", || {
+            broom_fs::write_atomic_stamped(path, md.as_bytes())
+        }) {
             Some(Ok(mtime)) => {
                 self.safety.record_stamp(path, mtime, md.as_bytes());
                 self.safety.cancel_save(path);
@@ -377,7 +379,13 @@ impl Workspace {
         .detach();
     }
 
-    fn finish_save_as(&mut self, key: &str, path: PathBuf, then_close: bool, cx: &mut Context<Self>) {
+    fn finish_save_as(
+        &mut self,
+        key: &str,
+        path: PathBuf,
+        then_close: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.as_ref().and_then(|t| t.read(cx).ref_by_key(key)) else {
             return;
         };
@@ -556,9 +564,9 @@ impl Workspace {
 
     /// True while a conflict dialog for `path` is open.
     fn conflict_for(&self, path: &Path, cx: &App) -> bool {
-        self.dialog.as_ref().is_some_and(|d| {
-            matches!(&d.read(cx).kind, DialogKind::Conflict { path: p, .. } if p == path)
-        })
+        self.dialog.as_ref().is_some_and(
+            |d| matches!(&d.read(cx).kind, DialogKind::Conflict { path: p, .. } if p == path),
+        )
     }
 
     /// Key of the active tab's draft.

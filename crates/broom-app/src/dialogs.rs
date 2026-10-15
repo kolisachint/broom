@@ -232,7 +232,14 @@ impl Render for Dialog {
                     .child(self.title()),
             )
             .child(div().child(self.body()))
-            .child(div().flex().flex_row().flex_wrap().gap_3().children(buttons))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_3()
+                    .children(buttons),
+            )
             .child(
                 div()
                     .text_size(px(14.))
