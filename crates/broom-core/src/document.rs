@@ -857,6 +857,29 @@ mod edit_tests {
         assert!(doc.insert_text(at(0, 0), "\n").is_err());
         assert_eq!(doc.to_markdown(), "| a | Xb |\n| --- | --- |\n| 1 | 2 |\n");
     }
+
+    #[test]
+    fn hard_break_keeps_its_source_form_after_edit() {
+        for (src, brk) in [("foo  \nbar\n", "  \n"), ("foo\\\nbar\n", "\\\n")] {
+            let mut doc = Document::parse(src);
+            doc.insert_text(at(0, 0), "X").unwrap();
+            assert_eq!(doc.visible_text(0).unwrap(), "Xfoo\nbar");
+            assert_eq!(doc.to_markdown(), format!("Xfoo{brk}bar\n"));
+            let again = Document::parse(&doc.to_markdown());
+            assert_eq!(again.visible_text(0).unwrap(), "Xfoo\nbar");
+            assert_eq!(again.block(0).unwrap().kind(), doc.block(0).unwrap().kind());
+        }
+    }
+
+    #[test]
+    fn hard_break_is_marked_in_runs() {
+        let doc = Document::parse("foo\\\nbar\n");
+        let BlockKind::Paragraph { content } = doc.block(0).unwrap().kind() else {
+            panic!("expected a paragraph");
+        };
+        let brk = content.iter().find(|r| r.text == "\n").unwrap();
+        assert_eq!(brk.style.hard_break, Some(crate::HardBreak::Backslash));
+    }
 }
 
 #[cfg(test)]

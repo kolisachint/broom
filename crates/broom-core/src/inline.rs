@@ -27,6 +27,19 @@ pub struct Style {
     pub link: Option<String>,
     /// Wikilink `[[target|alias]]`.
     pub wikilink: Option<WikiTarget>,
+    /// Hard line break. The run text is `\n`. Holds the form the source used,
+    /// so an edited block writes the break the same way.
+    pub hard_break: Option<HardBreak>,
+}
+
+/// How a hard line break was written in markdown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HardBreak {
+    /// Two or more trailing spaces, then the newline (the default).
+    #[default]
+    Spaces,
+    /// A backslash, then the newline.
+    Backslash,
 }
 
 #[cfg(test)]

@@ -36,7 +36,7 @@ pub use block::{Align, Block, BlockKind, BlockType, ListItem, OpaqueKind};
 pub use broom_links::WikiTarget;
 pub use document::Document;
 pub use edit::{EditError, StyleFlag};
-pub use inline::{Run, Style};
+pub use inline::{HardBreak, Run, Style};
 pub use input_rules::InputRuleOutcome;
 pub use pos::{DocPos, DocRange};
 

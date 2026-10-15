@@ -10,7 +10,7 @@ use broom_links::WikiTarget;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::block::{Align, Block, BlockKind, ListItem, OpaqueKind};
-use crate::inline::{Run, Style};
+use crate::inline::{HardBreak, Run, Style};
 
 /// Splits `src` into blocks. Concatenating `source()` of the result equals `src`.
 pub(crate) fn parse_blocks(src: &str) -> Vec<Block> {
@@ -26,10 +26,10 @@ pub(crate) fn parse_blocks(src: &str) -> Vec<Block> {
 
     // Text that produces no events (link reference definitions) is locked.
     let mut cursor = base;
-    for (start, end, evs) in &groups {
+    for (start, end, evs, forms) in &groups {
         push_gap(src, cursor, *start, &mut parts);
         let kind = math_block(&src[*start..*end], evs)
-            .or_else(|| Builder::new(evs).block_all())
+            .or_else(|| Builder::new(evs, forms).block_all())
             .unwrap_or_else(|| BlockKind::Opaque {
                 kind: opaque_kind(evs),
             });
@@ -106,13 +106,13 @@ fn front_matter(src: &str) -> Option<(usize, String)> {
 }
 
 /// Groups the events of a text into top-level blocks: (start, end, events),
-/// with absolute offsets.
-fn top_level_groups(text: &str, base: usize) -> Vec<(usize, usize, Vec<Event<'_>>)> {
-    let mut groups: Vec<(usize, usize, Vec<Event>)> = Vec::new();
+/// with absolute offsets. The third list holds, for each event, the form of a hard break.
+fn top_level_groups(text: &str, base: usize) -> Vec<TopGroup<'_>> {
+    let mut groups: Vec<TopGroup> = Vec::new();
     let mut depth = 0usize;
     for (ev, range) in Parser::new_ext(text, options()).into_offset_iter() {
         if depth == 0 && !matches!(ev, Event::End(_)) {
-            groups.push((range.start + base, range.end + base, Vec::new()));
+            groups.push((range.start + base, range.end + base, Vec::new(), Vec::new()));
         }
         match ev {
             Event::Start(_) => depth += 1,
@@ -121,10 +121,27 @@ fn top_level_groups(text: &str, base: usize) -> Vec<(usize, usize, Vec<Event<'_>
         }
         if let Some(group) = groups.last_mut() {
             group.1 = range.end + base;
+            group.3.push(hard_break_form(&ev, text, &range));
             group.2.push(ev);
         }
     }
     groups
+}
+
+/// One top-level block: (start, end, events, hard break form per event).
+type TopGroup<'a> = (usize, usize, Vec<Event<'a>>, Vec<Option<HardBreak>>);
+
+/// The form of a hard break, read from the source it covers. `None` for other events.
+fn hard_break_form(ev: &Event, text: &str, range: &std::ops::Range<usize>) -> Option<HardBreak> {
+    if !matches!(ev, Event::HardBreak) {
+        return None;
+    }
+    let src = text.get(range.clone()).unwrap_or_default();
+    Some(if src.starts_with('\\') {
+        HardBreak::Backslash
+    } else {
+        HardBreak::Spaces
+    })
 }
 
 /// A `$$ ... $$` paragraph becomes a math block. Returns `None` otherwise.
@@ -168,12 +185,14 @@ fn opaque_kind(evs: &[Event]) -> OpaqueKind {
 /// Returns `None` when the block uses syntax that cannot be represented.
 struct Builder<'e, 'a> {
     evs: &'e [Event<'a>],
+    /// Hard break form for each event, same length as `evs`.
+    forms: &'e [Option<HardBreak>],
     i: usize,
 }
 
 impl<'e, 'a> Builder<'e, 'a> {
-    fn new(evs: &'e [Event<'a>]) -> Self {
-        Builder { evs, i: 0 }
+    fn new(evs: &'e [Event<'a>], forms: &'e [Option<HardBreak>]) -> Self {
+        Builder { evs, forms, i: 0 }
     }
 
     fn peek(&self) -> Option<&'e Event<'a>> {
@@ -410,7 +429,12 @@ impl<'e, 'a> Builder<'e, 'a> {
                     s.math = true;
                     push_run(&mut runs, m, &s);
                 }
-                Event::SoftBreak | Event::HardBreak => push_run(&mut runs, "\n", &style),
+                Event::SoftBreak => push_run(&mut runs, "\n", &style),
+                Event::HardBreak => {
+                    let mut s = style.clone();
+                    s.hard_break = Some(self.forms.get(self.i).copied().flatten().unwrap_or_default());
+                    push_run(&mut runs, "\n", &s);
+                }
                 Event::Start(Tag::Image { .. })
                 | Event::InlineHtml(_)
                 | Event::FootnoteReference(_) => return None,

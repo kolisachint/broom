@@ -1,7 +1,7 @@
 //! Serializing an edited block back to markdown. Crate-private.
 
 use crate::block::{Align, BlockKind, ListItem};
-use crate::inline::{Run, Style};
+use crate::inline::{HardBreak, Run, Style};
 
 /// Re-serializes `kind` into markdown. Keeps the trailing blank-line separator
 /// of `old_source`, so the block still joins the next one the same way.
@@ -185,6 +185,8 @@ enum Md {
     Text(String),
     /// Markdown already written (code span, math, wikilink).
     Raw(String),
+    /// A hard line break, written in its source form. The next text starts a line.
+    Break(String),
 }
 
 /// Inline markdown for a list of runs. Spans are nested: a span stays open
@@ -211,6 +213,21 @@ pub(crate) fn inline_md(runs: &[Run]) -> String {
 /// a styled run are plain, so no delimiter is left next to a space.
 fn pieces(run: &Run) -> Vec<(Md, Vec<Span>)> {
     let s = &run.style;
+    if let Some(form) = s.hard_break {
+        let brk = match form {
+            HardBreak::Spaces => "  \n",
+            HardBreak::Backslash => "\\\n",
+        };
+        let want = spans_of(s);
+        return run
+            .text
+            .chars()
+            .map(|c| match c {
+                '\n' => (Md::Break(brk.to_string()), want.clone()),
+                c => (Md::Text(c.to_string()), want.clone()),
+            })
+            .collect();
+    }
     if let Some(w) = &s.wikilink {
         let md = if run.text == w.target {
             format!("[[{}]]", w.target)
@@ -299,6 +316,10 @@ fn emit(out: &mut String, open: &mut Vec<Span>, line_start: &mut bool, want: &[S
         Md::Raw(s) => {
             out.push_str(&s);
             *line_start = false;
+        }
+        Md::Break(s) => {
+            out.push_str(&s);
+            *line_start = true;
         }
     }
 }
