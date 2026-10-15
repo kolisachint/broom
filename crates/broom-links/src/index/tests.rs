@@ -1,4 +1,3 @@
-
 use super::*;
 use tempfile::TempDir;
 
@@ -405,4 +404,230 @@ fn rename_same_name_is_noop() {
     write(root, "src.md", "[[old]]");
     let index = LinkIndex::build(root).unwrap();
     assert!(index.rename_rewrite(&old, &old).unwrap().is_empty());
+}
+
+/// Path of `target` relative to the current directory, as `build` would get it.
+fn relative_to_cwd(target: &Path) -> PathBuf {
+    let cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    let target = fs::canonicalize(target).unwrap();
+    let common = cwd
+        .components()
+        .zip(target.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut rel = PathBuf::new();
+    for _ in common..cwd.components().count() {
+        rel.push("..");
+    }
+    for c in target.components().skip(common) {
+        rel.push(c);
+    }
+    rel
+}
+
+#[test]
+fn rename_tie_break_keeps_sorted_order() {
+    // Regression: `old` must keep its sorted place among same-stem files.
+    let dir = folder();
+    let root = dir.path();
+    let old = write(root, "a/x.md", "");
+    write(root, "b/x.md", "");
+    let src = write(root, "src.md", "[[x]]");
+    let index = LinkIndex::build(root).unwrap();
+    assert_eq!(index.resolve("x"), Some(old.as_path()));
+    let out = index.rename_rewrite(&old, &root.join("c/y.md")).unwrap();
+    assert_eq!(out, vec![(src, "[[y]]".to_string())]);
+}
+
+#[test]
+fn rename_bare_name_checked_after_rename() {
+    // Regression: `[[new]]` would reach b/new.md after the rename, so the
+    // rewrite must use the path.
+    let dir = folder();
+    let root = dir.path();
+    let old = write(root, "a/old.md", "");
+    write(root, "b/new.md", "");
+    let src = write(root, "src.md", "[[old]] [[old|Alias]]");
+    let index = LinkIndex::build(root).unwrap();
+    let out = index.rename_rewrite(&old, &root.join("c/new.md")).unwrap();
+    assert_eq!(out, vec![(src, "[[c/new]] [[c/new|Alias]]".to_string())]);
+}
+
+#[test]
+fn rename_rejects_names_that_cannot_be_written_in_links() {
+    let dir = folder();
+    let root = dir.path();
+    let old = write(root, "old.md", "");
+    write(root, "src.md", "[[old]]");
+    let index = LinkIndex::build(root).unwrap();
+    let bad = [
+        "bad|name",
+        "bad#x",
+        "a[b",
+        "a]b",
+        "a\\b",
+        " lead",
+        "trail ",
+        "two\nlines",
+    ];
+    for name in bad {
+        let err = index
+            .rename_rewrite(&old, &root.join(format!("{name}.md")))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name:?}");
+    }
+    // A folder name is checked too, through the qualified form.
+    let err = index
+        .rename_rewrite(&old, &root.join("bad|dir/x.md"))
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    // A plain name still works.
+    assert!(
+        index
+            .rename_rewrite(&old, &root.join("fine name.md"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn rename_skips_indented_and_quoted_code_but_not_list_continuation() {
+    let dir = folder();
+    let root = dir.path();
+    let old = write(root, "old.md", "");
+    let text = "- item [[old]]\n\n    more [[old]]\n\npara\n\n    code [[old]]\n\n> ```\n> [[old]]\n> ```\n";
+    let src = write(root, "src.md", text);
+    let index = LinkIndex::build(root).unwrap();
+    let out = index.rename_rewrite(&old, &root.join("new.md")).unwrap();
+    let expected = "- item [[new]]\n\n    more [[new]]\n\npara\n\n    code [[old]]\n\n> ```\n> [[old]]\n> ```\n";
+    assert_eq!(out, vec![(src, expected.to_string())]);
+}
+
+#[test]
+fn rename_keeps_table_escaped_pipes() {
+    let dir = folder();
+    let root = dir.path();
+    let old = write(root, "old.md", "");
+    let src = write(root, "t.md", "| [[old\\|Shown]] | [[old\\|x#H]] |");
+    let index = LinkIndex::build(root).unwrap();
+    let out = index.rename_rewrite(&old, &root.join("new.md")).unwrap();
+    assert_eq!(
+        out,
+        vec![(src, "| [[new\\|Shown]] | [[new\\|x#H]] |".to_string())]
+    );
+}
+
+#[test]
+fn rename_self_link_is_returned_under_new_path() {
+    let dir = folder();
+    let root = dir.path();
+    let old = write(root, "old.md", "[[old]] and [[old#Top|T]]");
+    let index = LinkIndex::build(root).unwrap();
+    let new = fs::canonicalize(root).unwrap().join("renamed.md");
+    let out = index.rename_rewrite(&old, &new).unwrap();
+    assert_eq!(
+        out,
+        vec![(new.clone(), "[[renamed]] and [[renamed#Top|T]]".to_string())]
+    );
+    // The caller may already have renamed the file on disk.
+    fs::rename(&old, &new).unwrap();
+    let out = index.rename_rewrite(&old, &new).unwrap();
+    assert_eq!(out[0].0, new);
+    assert_eq!(out[0].1, "[[renamed]] and [[renamed#Top|T]]");
+}
+
+#[test]
+fn relative_root_and_absolute_update_are_one_entry() {
+    // Regression: the same file must not be indexed twice.
+    let dir = folder();
+    let root = dir.path();
+    let a = write(root, "a.md", "[[b]]");
+    let rel_root = relative_to_cwd(root);
+    assert!(!rel_root.is_absolute());
+    let mut index = LinkIndex::build(&rel_root).unwrap();
+    assert!(index.root().is_absolute());
+    assert_eq!(index.files.len(), 1);
+    // Non-canonical absolute path (on macOS, /var is a symlink to /private/var).
+    index.update_file(&root.join("a.md"), "[[c]]");
+    assert_eq!(index.files.len(), 1);
+    index.update_file(&a, "[[d]]");
+    index.update_file(Path::new("a.md"), "[[e]]");
+    assert_eq!(index.files.len(), 1);
+    assert_eq!(index.backlinks("e").len(), 1);
+    assert!(index.backlinks("d").is_empty());
+    index.remove_file(&root.join("a.md"));
+    assert!(index.files.is_empty());
+}
+
+#[test]
+fn resolver_cache_follows_updates_and_removals() {
+    let dir = folder();
+    let root = dir.path();
+    let mut index = LinkIndex::build(root).unwrap();
+    assert_eq!(index.resolve("b"), None);
+    let b = root.join("b.md");
+    index.update_file(&b, "");
+    assert_eq!(
+        index.resolve("b"),
+        Some(fs::canonicalize(root).unwrap().join("b.md").as_path())
+    );
+    index.remove_file(&b);
+    assert_eq!(index.resolve("b"), None);
+}
+
+#[test]
+fn rename_skips_unreadable_files_and_keeps_going() {
+    let dir = folder();
+    let root = dir.path();
+    let old = write(root, "old.md", "");
+    let bad = root.join("bad.md");
+    fs::write(&bad, b"\xff\xfe [[old]]").unwrap();
+    let good = write(root, "good.md", "[[old]]");
+    let mut index = LinkIndex::build(root).unwrap();
+    // Indexed as linking to `old`, but the disk copy is not UTF-8.
+    index.update_file(&bad, "[[old]]");
+    let out = index.rename_rewrite(&old, &root.join("new.md")).unwrap();
+    assert_eq!(out, vec![(good, "[[new]]".to_string())]);
+}
+
+#[test]
+fn markdown_extension_is_indexed() {
+    let dir = folder();
+    let root = dir.path();
+    write(root, "x.markdown", "[[y]]");
+    write(root, "y.md", "");
+    let index = LinkIndex::build(root).unwrap();
+    assert_eq!(index.files.len(), 2);
+    assert_eq!(
+        index.resolve("x"),
+        Some(fs::canonicalize(root).unwrap().join("x.markdown").as_path())
+    );
+    assert_eq!(index.backlinks("y").len(), 1);
+}
+
+#[test]
+fn completions_bounded_selection_keeps_prefix_matches_first() {
+    let dir = folder();
+    let root = dir.path();
+    for i in 0..55 {
+        write(root, &format!("x-note{i:02}.md"), "");
+    }
+    write(root, "note-prefix.md", "");
+    let index = LinkIndex::build(root).unwrap();
+    let got = index.completions("note");
+    assert_eq!(got.len(), 50);
+    assert_eq!(got[0].target, "note-prefix");
+    assert_eq!(got[1].target, "x-note00");
+}
+
+#[test]
+fn rename_with_relative_root_and_relative_paths() {
+    let dir = folder();
+    let root = dir.path();
+    write(root, "old.md", "");
+    let src = write(root, "src.md", "[[old]]");
+    let index = LinkIndex::build(&relative_to_cwd(root)).unwrap();
+    let out = index
+        .rename_rewrite(Path::new("old.md"), Path::new("new.md"))
+        .unwrap();
+    assert_eq!(out, vec![(src, "[[new]]".to_string())]);
 }

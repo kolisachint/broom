@@ -278,9 +278,12 @@ impl LinkIndex {
                 .filter(|(k, _)| k.as_str() != old_key.as_str() && k.as_str() != new_key.as_str())
                 .map(|(_, e)| (e.path.clone(), e.norm.clone()))
         };
-        let before = Resolver::new(others().chain([(old.clone(), norm_key(&old_key))]));
-        let after = Resolver::new(others().chain([(new.clone(), norm_key(&new_key))]));
-        let bare_ok = after.resolve_key(&target_key(&new_stem)) == Some(new.as_path());
+        // Files are compared by key, not by path, as everywhere in the index.
+        let old_norm = norm_key(&old_key);
+        let new_norm = norm_key(&new_key);
+        let before = Resolver::new(others().chain([(old.clone(), old_norm.clone())]));
+        let after = Resolver::new(others().chain([(new.clone(), new_norm.clone())]));
+        let bare_ok = after.resolves_to(&target_key(&new_stem), &new_norm);
 
         let mut out = Vec::new();
         for (key, entry) in &self.files {
@@ -301,7 +304,7 @@ impl LinkIndex {
             let mut buf = String::new();
             let mut cursor = 0;
             for link in find_wikilinks(&text) {
-                if before.resolve_key(&target_key(&link.link.target)) != Some(old.as_path()) {
+                if !before.resolves_to(&target_key(&link.link.target), &old_norm) {
                     continue;
                 }
                 let name = name_range(&text, &link.span);
@@ -493,6 +496,11 @@ impl Resolver {
     /// key equals `key` or ends in `/key`. Exact match first, then fewest
     /// folders, then sorted order.
     fn resolve_key(&self, key: &str) -> Option<&Path> {
+        self.resolve_index(key).map(|i| self.entries[i].0.as_path())
+    }
+
+    /// Index into `entries` of the file `key` resolves to.
+    fn resolve_index(&self, key: &str) -> Option<usize> {
         if key.is_empty() {
             return None;
         }
@@ -500,10 +508,21 @@ impl Resolver {
         let suffix = format!("/{key}");
         let idxs = self.by_stem.get(stem)?;
         idxs.iter()
-            .map(|&i| &self.entries[i])
-            .filter(|(_, k)| k == key || k.ends_with(&suffix))
-            .min_by_key(|(_, k)| (k != key, k.matches('/').count()))
-            .map(|(path, _)| path.as_path())
+            .copied()
+            .filter(|&i| {
+                let k = &self.entries[i].1;
+                k == key || k.ends_with(&suffix)
+            })
+            .min_by_key(|&i| {
+                let k = &self.entries[i].1;
+                (k != key, k.matches('/').count())
+            })
+    }
+
+    /// True when `key` resolves to the file whose normalized key is `want`.
+    fn resolves_to(&self, key: &str, want: &str) -> bool {
+        self.resolve_index(key)
+            .is_some_and(|i| self.entries[i].1 == want)
     }
 }
 
