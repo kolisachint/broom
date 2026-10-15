@@ -105,7 +105,8 @@ impl Workspace {
             }),
         );
         let links = guarded("link index", || LinkIndex::build(&folder)).and_then(Result::ok);
-        let safety = Safety::new(settings.autosave_delay_ms, broom_config::recovery_dir());
+        let recovery_dir = guarded("recovery dir", broom_config::recovery_dir);
+        let safety = Safety::new(settings.autosave_delay_ms, recovery_dir);
         let ticker = cx.spawn(async move |this: WeakEntity<Workspace>, cx| {
             loop {
                 cx.background_executor().timer(TICK).await;
@@ -214,7 +215,9 @@ impl Workspace {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned());
         let rows = match (&self.links, stem) {
-            (Some(index), Some(stem)) => backlink_rows(index, &stem),
+            (Some(index), Some(stem)) => {
+                guarded("backlinks", || backlink_rows(index, &stem)).unwrap_or_default()
+            }
             _ => Vec::new(),
         };
         panel.update(cx, |p, cx| {
@@ -252,7 +255,17 @@ impl Workspace {
     /// macOS default app. A dirty buffer is saved first; if that fails the
     /// file is not opened.
     pub fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !broom_fs::is_markdown(&path) {
+        // Extension check when the library stub is unavailable.
+        let md = guarded("is_markdown", || broom_fs::is_markdown(&path)).unwrap_or_else(|| {
+            matches!(
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_lowercase)
+                    .as_deref(),
+                Some("md" | "markdown")
+            )
+        });
+        if !md {
             if let Some(Err(err)) = guarded("open", || broom_fs::open_external(&path)) {
                 eprintln!("broom: could not open {}: {err}", path.display());
             }
@@ -300,7 +313,7 @@ impl Workspace {
                 self.safety.cancel_save(&path);
                 self.safety.discard_draft();
                 if let Some(index) = self.links.as_mut() {
-                    index.update_file(&path, &md);
+                    let _ = guarded("link index", || index.update_file(&path, &md));
                 }
                 editor.update(cx, |ed, _| ed.mark_saved());
                 if self.conflict_open(cx) {

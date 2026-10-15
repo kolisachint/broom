@@ -32,12 +32,13 @@ pub struct Safety {
 
 impl Safety {
     /// Builds the safety state. `delay_ms` is `autosave_delay_ms`.
-    pub fn new(delay_ms: u64, recovery_dir: PathBuf) -> Safety {
+    /// `recovery_dir` is `None` when the path could not be resolved; drafts are then off.
+    pub fn new(delay_ms: u64, recovery_dir: Option<PathBuf>) -> Safety {
         let saver = guarded("autosave", || {
             AutoSaver::new(Duration::from_millis(delay_ms))
         });
         let conflicts = guarded("conflict check", ConflictDetector::new);
-        let recovery = guarded("recovery", || Recovery::new(recovery_dir));
+        let recovery = recovery_dir.and_then(|dir| guarded("recovery", || Recovery::new(dir)));
         let (watcher, events) = guarded("file watcher", Watcher::new)
             .and_then(Result::ok)
             .map_or((None, None), |(w, rx)| (Some(w), Some(rx)));
