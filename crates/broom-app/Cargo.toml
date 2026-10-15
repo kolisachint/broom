@@ -16,3 +16,5 @@ broom-links.workspace = true
 broom-math.workspace = true
 broom-vim.workspace = true
 gpui-kit.workspace = true
+# Same version GPUI uses (Cargo.lock). Frames for math images.
+image = { version = "0.25.10", default-features = false }

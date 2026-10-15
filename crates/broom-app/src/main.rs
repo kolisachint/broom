@@ -10,10 +10,14 @@
 #![allow(dead_code)]
 
 mod cheatsheet;
+mod dialogs;
 mod editor;
 mod keys;
 mod palette;
+mod right_panel;
+mod safety;
 mod search;
+mod status_bar;
 mod tabs;
 mod theme;
 mod tree_panel;

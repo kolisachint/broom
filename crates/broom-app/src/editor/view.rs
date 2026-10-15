@@ -52,6 +52,7 @@ use crate::keys::Run;
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.math.scale = window.scale_factor();
         let focus = self
             .focus_handle
             .get_or_insert_with(|| cx.focus_handle())
@@ -216,6 +217,13 @@ impl Editor {
                 .my_3()
                 .bg(color(theme::RULE))
                 .into_any_element()
+        } else if let Some(seg) = line
+            .segs
+            .first()
+            .filter(|s| line.deco == Deco::Math && self.caret_in(line.block, s).is_none())
+        {
+            // Math line with the caret elsewhere: paint the formula.
+            self.math.display_element(&seg.text, mono.clone(), size)
         } else if let Some(seg) = line.segs.first() {
             let caret = self.caret_in(line.block, seg);
             let sel = self.sel_in(line.block, seg);

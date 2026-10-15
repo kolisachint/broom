@@ -125,7 +125,7 @@ impl Tabs {
                     tab.pinned = true;
                 }
                 cx.notify();
-                this.update_workspace(cx, |ws, cx| ws.refresh_status(cx));
+                this.update_workspace(cx, |ws, cx| ws.on_edited(cx));
             }
         })
     }
@@ -190,7 +190,7 @@ impl Tabs {
                 tab.title = file_name(&tab.path).into();
             }
         }
-        cx.notify();
+        self.sync_center(cx);
     }
 
     /// Path of the active tab, if any.
@@ -215,14 +215,10 @@ impl Tabs {
 
     /// Puts the active editor into the workspace's centre slot.
     fn sync_center(&self, cx: &mut Context<Self>) {
-        let editor = self
-            .active
-            .and_then(|i| self.tabs.get(i))
-            .map(|t| t.editor.clone());
-        self.update_workspace(cx, |ws, cx| {
-            ws.center = editor;
-            ws.refresh_status(cx);
-        });
+        let active = self.active.and_then(|i| self.tabs.get(i));
+        let editor = active.map(|t| t.editor.clone());
+        let path = active.map(|t| t.path.clone());
+        self.update_workspace(cx, |ws, cx| ws.adopt(editor, path, cx));
         cx.notify();
     }
 

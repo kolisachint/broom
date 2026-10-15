@@ -314,7 +314,7 @@ impl Workspace {
                 // GAP: the line is not used yet; the editor has no goto-line.
                 let path = path.clone();
                 this.close_overlay(cx);
-                this.open_file(&path, cx);
+                this.open_file(path, cx);
             }
             SearchEvent::Dismiss => this.close_overlay(cx),
         });

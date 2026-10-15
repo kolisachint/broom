@@ -6,6 +6,7 @@
 //! lives in the app root: it calls the methods here.
 
 pub mod input;
+pub mod math;
 pub mod rows;
 pub mod view;
 pub mod vim;
@@ -104,6 +105,8 @@ pub struct Editor {
     /// True when the source view changed the document without a doc edit.
     /// Re-parsing resets the document's own dirty flag.
     pub reparsed: bool,
+    /// Paints display math. See [`math`].
+    pub math: math::MathPainter,
     subs: Vec<Subscription>,
 }
 
@@ -132,6 +135,7 @@ impl Editor {
             wiki: None,
             wiki_sel: 0,
             reparsed: false,
+            math: math::MathPainter::default(),
             subs: Vec::new(),
         }
     }

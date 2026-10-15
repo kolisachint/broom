@@ -104,6 +104,11 @@ impl TreeView {
 
     /// Moves the selection by `delta` rows. Starts at the top when nothing
     /// is selected.
+    /// Moves keyboard focus into the tree. Bound to `Command::FocusTree`.
+    pub fn focus_tree(&self, window: &mut Window, cx: &mut App) {
+        self.focus.focus(window, cx);
+    }
+
     pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let rows = self.rows();
         if rows.is_empty() {
@@ -582,6 +587,7 @@ pub fn install(ws: &mut Workspace, cx: &mut Context<Workspace>) {
     let root = ws.folder.clone();
     let vim_enabled = settings.vim_enabled;
     let tree = cx.new(|cx| TreeView::new(root, tabs.clone(), vim_enabled, cx));
-    ws.set_left(tree, cx);
+    ws.set_left(tree.clone(), cx);
+    ws.tree = Some(tree);
     ws.tabs = Some(tabs);
 }

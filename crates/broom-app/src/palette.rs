@@ -9,7 +9,7 @@
 //! [`Workspace::open_quick_open`]. Escape emits [`PaletteEvent::Dismiss`].
 
 use std::cmp::Reverse;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use broom_config::{Chord, Command, Keymap};
 use gpui_kit::*;
@@ -506,7 +506,7 @@ impl Workspace {
                 PaletteEvent::Open(path) => {
                     let path = path.clone();
                     this.close_overlay(cx);
-                    this.open_file(&path, cx);
+                    this.open_file(path, cx);
                 }
                 PaletteEvent::Dismiss => this.close_overlay(cx),
             },
@@ -538,12 +538,6 @@ impl Workspace {
         self.dispatch(cmd, window, cx);
     }
 
-    /// Opens a file as a pinned tab. Explicit choices (palette, search) pin.
-    pub fn open_file(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if let Some(tabs) = &self.tabs {
-            tabs.update(cx, |tabs, cx| tabs.open(path, true, cx));
-        }
-    }
 }
 
 #[cfg(test)]

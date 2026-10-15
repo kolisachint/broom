@@ -12,6 +12,7 @@
 use broom_config::{Binding, Chord, Command, Context as KeyScope, Keymap, Settings, keymap_path};
 use gpui_kit::*;
 
+use crate::right_panel::PanelTab;
 use crate::theme;
 use crate::workspace::{Workspace, guarded};
 
@@ -34,6 +35,8 @@ const FALLBACK: &[(&str, Command, Option<&str>)] = &[
     ("cmd-p", Command::QuickOpen, None),
     ("cmd-shift-p", Command::CommandPalette, None),
     ("cmd-k z", Command::ZenMode, None),
+    ("cmd-w", Command::CloseTab, None),
+    ("cmd-alt-b", Command::ToggleRightPanel, None),
     ("cmd-z", Command::Undo, Some("Editor")),
     ("cmd-shift-z", Command::Redo, Some("Editor")),
     ("cmd-b", Command::Bold, Some("Editor")),
@@ -114,11 +117,50 @@ impl Workspace {
             Command::ZoomOut => self.zoom_by(-ZOOM_STEP, cx),
             Command::ZoomReset => self.set_font_size(Settings::default().font_size, cx),
             Command::ZenMode => self.toggle_zen(cx),
+            Command::Save => self.save(false, cx),
+            Command::CloseTab => self.close_tab(cx),
+            Command::ToggleTree => self.toggle_tree(cx),
+            Command::FocusTree => self.focus_tree(window, cx),
+            Command::ToggleRightPanel => self.toggle_right_panel(cx),
+            Command::Outline => self.show_outline(cx),
             Command::CommandPalette => self.open_palette(window, cx),
             Command::QuickOpen => self.open_quick_open(window, cx),
             Command::SearchFolder => self.open_search(window, cx),
             Command::Cheatsheet => self.open_cheatsheet(window, cx),
             _ => eprintln!("broom: {cmd:?} is not wired yet"),
+        }
+    }
+
+    /// Closes the active tab. Deferred: closing switches the centre editor,
+    /// which calls back into this workspace.
+    fn close_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(tabs) = self.tabs.clone() {
+            cx.defer(move |cx| tabs.update(cx, |tabs, cx| tabs.close_active(cx)));
+        }
+    }
+
+    /// Shows or hides the file tree column.
+    pub fn toggle_tree(&mut self, cx: &mut Context<Self>) {
+        self.tree_visible = !self.tree_visible;
+        cx.notify();
+    }
+
+    /// Shows the tree and moves keyboard focus into it.
+    fn focus_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_visible = true;
+        if let Some(tree) = self.tree.clone() {
+            tree.update(cx, |tree, cx| tree.focus_tree(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Shows the right panel on its outline list.
+    fn show_outline(&mut self, cx: &mut Context<Self>) {
+        if let Some(panel) = self.right_panel.clone() {
+            panel.update(cx, |p, cx| {
+                p.set_tab(PanelTab::Outline, cx);
+                p.set_visible(true, cx);
+            });
         }
     }
 
