@@ -10,7 +10,9 @@
 #![allow(dead_code)]
 
 mod editor;
+mod tabs;
 mod theme;
+mod tree_panel;
 mod workspace;
 
 use std::path::PathBuf;

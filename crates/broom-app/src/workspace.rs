@@ -37,6 +37,8 @@ pub struct Workspace {
     pub center: Option<Entity<Editor>>,
     /// Right panel. `None` draws the empty placeholder pane.
     pub right: Option<AnyView>,
+    /// Tab strip above the centre editor. Set by `tree_panel::install`.
+    pub tab_bar: Option<AnyView>,
     /// Status bar text. Refreshed from the editor on every edit.
     pub status: SharedString,
     settings: Settings,
@@ -82,10 +84,12 @@ impl Workspace {
             left: None,
             center,
             right: None,
+            tab_bar: None,
             status: SharedString::default(),
             settings,
             _subs: subs,
         };
+        crate::tree_panel::install(&mut ws, cx);
         ws.refresh_status(cx);
         ws
     }
@@ -153,14 +157,16 @@ impl Workspace {
             Some(editor) => editor.clone().into_any_element(),
             None => "Editor unavailable: no document loaded.".into_any_element(),
         };
-        div()
+        let mut pane = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
-            .h_full()
-            .p_6()
-            .child(body)
+            .h_full();
+        if let Some(tabs) = &self.tab_bar {
+            pane = pane.child(tabs.clone());
+        }
+        pane.child(div().flex_1().min_h_0().p_6().child(body))
     }
 }
 
