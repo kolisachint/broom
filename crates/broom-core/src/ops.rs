@@ -57,6 +57,7 @@ impl Document {
     /// Re-serializes block `i` after its kind changed. The result is re-parsed:
     /// if it reads back differently, the block is written as plain escaped text.
     pub(crate) fn sync(&mut self, i: usize) {
+        let has_next = i + 1 < self.blocks.len();
         let b = &mut self.blocks[i];
         let mut source = reserialize(&b.source, &b.kind);
         if !reads_back(&b.kind, &source) {
@@ -65,6 +66,9 @@ impl Document {
             if reads_back(&plain, &source) {
                 b.kind = plain;
             }
+        }
+        if has_next {
+            source = with_blank_separator(&source);
         }
         b.source = source;
         b.edited = true;
@@ -180,7 +184,10 @@ impl Document {
                 self.blocks[b].source = format!("{}\n\n", crate::serialize::kind_md(&head_kind));
                 self.blocks[b].kind = head_kind;
                 self.blocks[b].edited = true;
-                let source = format!("{}{}", crate::serialize::kind_md(&tail_kind), old_trailing);
+                let mut source = format!("{}{}", crate::serialize::kind_md(&tail_kind), old_trailing);
+                if b + 1 < self.blocks.len() {
+                    source = with_blank_separator(&source);
+                }
                 self.blocks.insert(
                     b + 1,
                     crate::block::Block {
@@ -277,19 +284,18 @@ impl Document {
         b: usize,
         to: usize,
     ) -> Result<(), EditError> {
+        // Blocks between a and b are dropped by the join, so they are checked too.
         for idx in a..=b {
-            match self.blocks[idx].kind {
+            let what = match self.blocks[idx].kind {
                 BlockKind::Opaque { .. } => return Err(EditError::Locked(idx)),
-                BlockKind::Table { .. } if idx == a || idx == b => {
-                    return Err(EditError::Unsupported("tables cannot be joined".into()));
-                }
-                BlockKind::BlockQuote { .. } if idx == a || idx == b => {
-                    return Err(EditError::Unsupported(
-                        "block quotes cannot be joined".into(),
-                    ));
-                }
-                _ => {}
-            }
+                BlockKind::Table { .. } => "tables",
+                BlockKind::BlockQuote { .. } => "block quotes",
+                BlockKind::FrontMatter { .. } => "front matter",
+                BlockKind::MathBlock { .. } => "math blocks",
+                BlockKind::CodeBlock { .. } => "code blocks",
+                _ => continue,
+            };
+            return Err(EditError::Unsupported(format!("{what} cannot be joined")));
         }
         let la = slots::to_lines(&self.blocks[a].kind).unwrap_or_default();
         let lb = slots::to_lines(&self.blocks[b].kind).unwrap_or_default();
@@ -366,6 +372,17 @@ impl Document {
     }
 }
 
+
+/// Makes sure a block that is followed by another ends with a blank line,
+/// so the two stay separate blocks.
+pub(crate) fn with_blank_separator(source: &str) -> String {
+    let trailing = trailing_of(source);
+    if trailing.matches('\n').count() >= 2 {
+        source.to_string()
+    } else {
+        format!("{}\n\n", &source[..source.len() - trailing.len()])
+    }
+}
 
 /// Whether `source` parses back to one block with the same kind and visible text.
 fn reads_back(kind: &BlockKind, source: &str) -> bool {

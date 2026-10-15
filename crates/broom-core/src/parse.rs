@@ -61,16 +61,21 @@ pub(crate) fn parse_blocks(src: &str) -> Vec<Block> {
     blocks
 }
 
-/// A non-blank gap between blocks becomes a locked opaque block.
+/// A non-blank gap between blocks becomes a locked opaque block. The blank
+/// lines before it stay with the block above.
 fn push_gap(src: &str, from: usize, to: usize, parts: &mut Vec<(usize, BlockKind)>) {
-    if to > from && !src[from..to].trim().is_empty() {
-        parts.push((
-            from,
-            BlockKind::Opaque {
-                kind: OpaqueKind::Unknown,
-            },
-        ));
+    let gap = &src[from..to];
+    if gap.trim().is_empty() {
+        return;
     }
+    let lead = gap.len() - gap.trim_start().len();
+    let start = from + gap[..lead].rfind('\n').map_or(0, |i| i + 1);
+    parts.push((
+        start,
+        BlockKind::Opaque {
+            kind: OpaqueKind::Unknown,
+        },
+    ));
 }
 
 fn options() -> Options {

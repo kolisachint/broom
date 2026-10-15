@@ -113,7 +113,10 @@ fn code_md(lang: Option<&str>, text: &str) -> String {
 }
 
 fn table_md(alignments: &[Align], header: &[Vec<Run>], rows: &[Vec<Vec<Run>>]) -> String {
-    let cols = alignments.len().max(header.len());
+    let cols = rows
+        .iter()
+        .map(Vec::len)
+        .fold(alignments.len().max(header.len()), usize::max);
     let row_md = |cells: &[Vec<Run>]| {
         let mut parts: Vec<String> = cells.iter().map(|c| cell_md(c)).collect();
         parts.resize(cols, String::new());
@@ -372,5 +375,19 @@ mod tests {
         };
         assert_eq!(content[0].style, st(false, true));
         assert_eq!(content[1].style, st(true, true));
+    }
+
+    #[test]
+    fn short_header_is_padded_and_wide_rows_keep_cells() {
+        let cell = |t: &str| vec![plain(t)];
+        let kind = BlockKind::Table {
+            alignments: vec![Align::None],
+            header: vec![cell("a")],
+            rows: vec![vec![cell("1"), cell("2"), cell("3")]],
+        };
+        assert_eq!(
+            kind_md(&kind),
+            "| a |  |  |\n| --- | --- | --- |\n| 1 | 2 | 3 |"
+        );
     }
 }

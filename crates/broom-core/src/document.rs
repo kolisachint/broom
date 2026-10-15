@@ -554,6 +554,30 @@ mod edit_tests {
     }
 
     #[test]
+    fn leading_whitespace_survives_reparse() {
+        let mut doc = Document::parse("Hi\n");
+        doc.insert_text(at(0, 0), "  \tX").unwrap();
+        assert_eq!(Document::parse(&doc.to_markdown()).visible_text(0).unwrap(), "  \tXHi");
+    }
+
+    #[test]
+    fn joins_refuse_code_math_and_front_matter() {
+        for src in ["```\nx\n```\n\npara\n", "$$\nx\n$$\n\npara\n", "---\na: 1\n---\n\npara\n"] {
+            let mut doc = Document::parse(src);
+            assert!(matches!(doc.merge_blocks(0), Err(EditError::Unsupported(_))), "{src:?}");
+            assert_eq!(doc.to_markdown(), src);
+        }
+    }
+
+    #[test]
+    fn kind_change_keeps_a_blank_line_before_next_block() {
+        let mut doc = Document::parse("# h\npara\n");
+        doc.set_block_kind(0, BlockType::Paragraph).unwrap();
+        assert_eq!(doc.to_markdown(), "h\n\npara\n");
+        assert_eq!(doc.block_count(), 2);
+    }
+
+    #[test]
     fn new_edit_clears_redo() {
         let mut doc = Document::parse("a\n");
         doc.insert_text(at(0, 1), "b").unwrap();
