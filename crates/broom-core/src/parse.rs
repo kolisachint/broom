@@ -338,11 +338,21 @@ impl<'e, 'a> Builder<'e, 'a> {
                 }
                 Event::Start(Tag::Paragraph) => {
                     self.i += 1;
+                    // In a loose item the task marker comes inside the paragraph.
+                    if let Some(Event::TaskListMarker(c)) = self.peek() {
+                        checked = Some(*c);
+                        self.i += 1;
+                    }
                     if !content.is_empty() {
                         push_run(&mut content, "\n", &Style::default());
                     }
                     content.extend(self.inline()?);
                     self.close()?;
+                }
+                Event::TaskListMarker(c) => {
+                    // A loose item puts the marker after its paragraph start.
+                    checked = Some(*c);
+                    self.i += 1;
                 }
                 Event::Start(Tag::List(_)) => {
                     self.i += 1;
@@ -357,6 +367,7 @@ impl<'e, 'a> Builder<'e, 'a> {
                 }
             }
         }
+        out[idx].checked = checked;
         out[idx].content = content;
         Some(())
     }

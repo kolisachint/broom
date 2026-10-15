@@ -159,6 +159,34 @@ impl BlockKind {
     }
 }
 
+impl BlockKind {
+    /// Number of `\n` in [`BlockKind::visible_text`], counted without building it.
+    /// Opaque blocks are not counted here; the document counts their source.
+    pub(crate) fn newline_count(&self) -> usize {
+        fn runs_nl(runs: &[Run]) -> usize {
+            runs.iter().map(|r| r.text.matches('\n').count()).sum()
+        }
+        match self {
+            BlockKind::Heading { content, .. } | BlockKind::Paragraph { content } => runs_nl(content),
+            BlockKind::List { items, .. } | BlockKind::TaskList { items } => {
+                items.iter().map(|it| runs_nl(&it.content)).sum::<usize>() + items.len().saturating_sub(1)
+            }
+            BlockKind::BlockQuote { children } => {
+                children.iter().map(BlockKind::newline_count).sum::<usize>()
+                    + children.len().saturating_sub(1)
+            }
+            BlockKind::CodeBlock { text, .. }
+            | BlockKind::FrontMatter { yaml: text }
+            | BlockKind::MathBlock { tex: text } => text.matches('\n').count(),
+            BlockKind::Table { header, rows, .. } => {
+                header.iter().chain(rows.iter().flatten()).map(|c| runs_nl(c)).sum::<usize>()
+                    + rows.len()
+            }
+            BlockKind::ThematicBreak | BlockKind::Opaque { .. } => 0,
+        }
+    }
+}
+
 /// Concatenated text of a run list.
 pub(crate) fn runs_text(runs: &[Run]) -> String {
     runs.iter().map(|r| r.text.as_str()).collect()

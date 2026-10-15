@@ -10,7 +10,7 @@ use crate::edit::EditError;
 use crate::inline::{Run, Style};
 use crate::pos::{DocPos, DocRange};
 use crate::runs;
-use crate::serialize::{reserialize, trailing_of};
+use crate::serialize::{reserialize_marks, trailing_of, Marks};
 use crate::slots::{self, Line};
 
 /// Blocks whose text is raw: a newline is a plain character.
@@ -54,6 +54,40 @@ impl Document {
         Ok(())
     }
 
+    /// List markers for block `i` that differ from its neighbouring lists.
+    fn marks_for(&self, i: usize) -> Marks {
+        let marker_of = |j: Option<usize>| -> (Option<char>, Option<char>) {
+            let Some(b) = j.and_then(|j| self.blocks.get(j)) else {
+                return (None, None);
+            };
+            let first = b.source.trim_start();
+            match b.kind {
+                BlockKind::List { ordered: false, .. } | BlockKind::TaskList { .. } => {
+                    (first.chars().next().filter(|c| matches!(c, '-' | '*' | '+')), None)
+                }
+                BlockKind::List { ordered: true, .. } => {
+                    let delim = first.chars().find(|c| !c.is_ascii_digit());
+                    (None, delim.filter(|c| *c == '.' || *c == ')'))
+                }
+                _ => (None, None),
+            }
+        };
+        let (prev_b, prev_d) = marker_of(i.checked_sub(1));
+        let (next_b, next_d) = marker_of(Some(i + 1));
+        let mut marks = Marks::default();
+        // Pick a bullet that neither neighbouring list uses.
+        if let Some(free) = ['-', '*', '+']
+            .into_iter()
+            .find(|c| Some(*c) != prev_b && Some(*c) != next_b)
+        {
+            marks.bullet = free;
+        }
+        if prev_d == Some('.') || next_d == Some('.') {
+            marks.delim = ')';
+        }
+        marks
+    }
+
     /// Writes `\n` line breaks in `s` the way the document does.
     pub(crate) fn eol(&self, s: String) -> String {
         if self.crlf {
@@ -63,11 +97,45 @@ impl Document {
         }
     }
 
+    /// Replaces the separator after block `i` (the text after its body).
+    /// A block followed by another always keeps a blank line.
+    fn set_trailing(&mut self, i: usize, trailing: &str) {
+        let source = &self.blocks[i].source;
+        let body = &source[..source.len() - trailing_of(source).len()];
+        let mut joined = format!("{body}{trailing}");
+        if i + 1 < self.blocks.len() {
+            joined = with_blank_separator(&joined);
+        }
+        self.blocks[i].source = joined;
+    }
+
     /// Re-serializes block `i` after its kind changed. The result is re-parsed:
     /// if it reads back differently, the block is written as plain escaped text.
     pub(crate) fn sync(&mut self, i: usize) {
+        self.write_block(i);
+        // A neighbouring bullet list with the same marker would merge with this one.
+        self.fix_list_markers();
+    }
+
+    /// The bullet character a bullet list's source starts with.
+    fn bullet_marker(&self, j: usize) -> Option<char> {
+        let b = self.blocks.get(j)?;
+        match b.kind {
+            BlockKind::List { ordered: false, .. } | BlockKind::TaskList { .. } => b
+                .source
+                .trim_start()
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '-' | '*' | '+')),
+            _ => None,
+        }
+    }
+
+    /// Re-serializes block `i` alone. See [`Document::sync`].
+    fn write_block(&mut self, i: usize) {
         let has_next = i + 1 < self.blocks.len();
         let crlf = self.crlf;
+        let marks = self.marks_for(i);
         let b = &mut self.blocks[i];
         // A heading is one line: soft breaks from a setext heading become spaces.
         if let BlockKind::Heading { content, .. } = &mut b.kind {
@@ -76,10 +144,29 @@ impl Document {
             }
             runs::normalize(content);
         }
-        let mut source = reserialize(&b.source, &b.kind);
+        // Empty quote lines have no markdown form; a quote keeps one line at least.
+        if let BlockKind::BlockQuote { children } = &mut b.kind {
+            let kept: Vec<BlockKind> = children
+                .iter()
+                .filter(|c| !matches!(c, BlockKind::Paragraph { content } if content.is_empty()))
+                .cloned()
+                .collect();
+            if !kept.is_empty() {
+                *children = kept;
+            }
+        }
+        // A paragraph or list item cannot hold a blank line or start/end with one.
+        if !matches!(b.kind, BlockKind::CodeBlock { .. } | BlockKind::FrontMatter { .. } | BlockKind::MathBlock { .. } | BlockKind::Heading { .. }) {
+            for slot in slots::slots_mut(&mut b.kind) {
+                if let slots::SlotMut::Runs(runs) = slot {
+                    tidy_breaks(runs);
+                }
+            }
+        }
+        let mut source = reserialize_marks(&b.source, &b.kind, marks);
         if !reads_back(&b.kind, &source) {
             let plain = strip_styles(&b.kind);
-            source = reserialize(&b.source, &plain);
+            source = reserialize_marks(&b.source, &plain, marks);
             if reads_back(&plain, &source) {
                 b.kind = plain;
             }
@@ -124,7 +211,27 @@ impl Document {
     }
 
     /// Puts a snapshot's blocks in place. Returns the snapshot that undoes this.
+    /// Bullet lists beside the restored region are re-serialized, since their
+    /// neighbours changed.
     pub(crate) fn apply_snapshot(&mut self, step: Snapshot) -> Snapshot {
+        let (start, restored) = (step.start, step.old.len());
+        let back = self.replace_region(step);
+        let _ = (start, restored);
+        self.fix_list_markers();
+        back
+    }
+
+    /// Re-serializes the second of every adjacent pair of bullet lists that share
+    /// a marker. Such lists would read back as one list.
+    fn fix_list_markers(&mut self) {
+        for j in 1..self.blocks.len() {
+            if self.bullet_marker(j).is_some() && self.bullet_marker(j) == self.bullet_marker(j - 1) {
+                self.write_block(j);
+            }
+        }
+    }
+
+    fn replace_region(&mut self, step: Snapshot) -> Snapshot {
         let len = self.blocks.len() - step.start - step.tail;
         let cur: Vec<Block> = self
             .blocks
@@ -141,6 +248,17 @@ impl Document {
     /// Checks an insert of `text` at `pos`.
     pub(crate) fn validate_insert(&self, pos: DocPos, text: &str) -> Result<(), EditError> {
         self.check_pos(pos)?;
+        if let BlockKind::MathBlock { .. } = &self.blocks[pos.block].kind {
+            let mut probe = self.blocks[pos.block].kind.clone();
+            insert_into_kind(&mut probe, pos.offset, text);
+            if let BlockKind::MathBlock { tex } = &probe
+                && !math_tex_ok(tex)
+            {
+                return Err(EditError::Unsupported(
+                    "a math block cannot hold $$ or a blank line".into(),
+                ));
+            }
+        }
         match &self.blocks[pos.block].kind {
             BlockKind::ThematicBreak if !text.is_empty() => Err(EditError::Unsupported(
                 "a thematic break has no text".into(),
@@ -201,21 +319,20 @@ impl Document {
                 };
                 // A blank line separates the halves, so they stay two paragraphs.
                 let old_trailing = trailing_of(&self.blocks[b].source).to_string();
-                self.blocks[b].source = self.eol(format!("{}\n\n", crate::serialize::kind_md(&head_kind)));
                 self.blocks[b].kind = head_kind;
-                self.blocks[b].edited = true;
-                let mut source = format!("{}{}", crate::serialize::kind_md(&tail_kind), old_trailing);
-                if b + 1 < self.blocks.len() {
-                    source = self.eol(with_blank_separator(&source));
-                }
+                self.sync(b);
+                let blank = self.eol("\n\n".to_string());
+                self.set_trailing(b, &blank);
                 self.blocks.insert(
                     b + 1,
                     crate::block::Block {
-                        source,
+                        source: String::new(),
                         kind: tail_kind,
                         edited: true,
                     },
                 );
+                self.sync(b + 1);
+                self.set_trailing(b + 1, &old_trailing);
                 DocPos::new(b + 1, 0)
             }
             BlockKind::List { .. } | BlockKind::TaskList { .. } => {
@@ -329,11 +446,12 @@ impl Document {
         })?;
         self.checkpoint(DocPos::new(a, from), false, a, b);
         // The joined block is followed by what followed the last block.
+        // The joined block is followed by what followed the last block.
         let after = trailing_of(&self.blocks[b].source).to_string();
         self.blocks.drain(a + 1..=b);
-        self.blocks[a].source = format!("{}{}", reserialize("", &new_kind), after);
         self.blocks[a].kind = new_kind;
-        self.blocks[a].edited = true;
+        self.sync(a);
+        self.set_trailing(a, &after);
         Ok(())
     }
 
@@ -416,6 +534,41 @@ fn reads_back(kind: &BlockKind, source: &str) -> bool {
     }
 }
 
+/// Collapses repeated `\n` and trims them from both ends of a run list.
+fn tidy_breaks(runs: &mut Vec<Run>) {
+    let mut prev_nl = false;
+    for r in runs.iter_mut() {
+        let mut out = String::with_capacity(r.text.len());
+        for c in r.text.chars() {
+            if c == '\n' {
+                if prev_nl {
+                    continue;
+                }
+                prev_nl = true;
+            } else {
+                prev_nl = false;
+            }
+            out.push(c);
+        }
+        r.text = out;
+    }
+    while runs.first().is_some_and(|r| r.text.starts_with('\n')) {
+        let first = &mut runs[0];
+        first.text.remove(0);
+        if first.text.is_empty() {
+            runs.remove(0);
+        }
+    }
+    while runs.last().is_some_and(|r| r.text.ends_with('\n')) {
+        let last = runs.len() - 1;
+        runs[last].text.pop();
+        if runs[last].text.is_empty() {
+            runs.pop();
+        }
+    }
+    runs::normalize(runs);
+}
+
 /// The same block with every run made plain (wikilinks, math and code too).
 fn strip_styles(kind: &BlockKind) -> BlockKind {
     let mut copy = kind.clone();
@@ -428,4 +581,17 @@ fn strip_styles(kind: &BlockKind) -> BlockKind {
         }
     }
     copy
+}
+
+/// A math body that reads back as exactly this math block: no `$$`, and no
+/// line that the markdown reader would take for another block.
+fn math_tex_ok(tex: &str) -> bool {
+    if tex.contains("$$") {
+        return false;
+    }
+    let kind = BlockKind::MathBlock {
+        tex: tex.to_string(),
+    };
+    let parsed = crate::parse::parse_blocks(&crate::serialize::kind_md(&kind));
+    matches!(parsed.as_slice(), [one] if one.kind == kind)
 }

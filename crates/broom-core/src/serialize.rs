@@ -5,8 +5,9 @@ use crate::inline::{Run, Style};
 
 /// Re-serializes `kind` into markdown. Keeps the trailing blank-line separator
 /// of `old_source`, so the block still joins the next one the same way.
-pub(crate) fn reserialize(old_source: &str, kind: &BlockKind) -> String {
-    let body = kind_md(kind);
+/// [`reserialize`] with the list markers chosen by the caller.
+pub(crate) fn reserialize_marks(old_source: &str, kind: &BlockKind, marks: Marks) -> String {
+    let body = kind_md_marks(kind, marks);
     format!("{body}{}", trailing_of(old_source))
 }
 
@@ -24,19 +25,41 @@ pub(crate) fn trailing_of(source: &str) -> &str {
 }
 
 /// Markdown for one block kind, without its trailing separator.
+/// List markers. Two lists separated only by a blank line merge in markdown
+/// when their markers match, so a list picks markers that differ from its neighbours.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Marks {
+    pub(crate) bullet: char,
+    pub(crate) delim: char,
+}
+
+impl Default for Marks {
+    fn default() -> Marks {
+        Marks {
+            bullet: '-',
+            delim: '.',
+        }
+    }
+}
+
 pub(crate) fn kind_md(kind: &BlockKind) -> String {
+    kind_md_marks(kind, Marks::default())
+}
+
+fn kind_md_marks(kind: &BlockKind, marks: Marks) -> String {
     match kind {
         BlockKind::Paragraph { content } => inline_md(content),
         BlockKind::Heading { level, content } => {
             let mut text = inline_md(content).replace('\n', " ");
-            if text.ends_with('#') {
+            // A closing `#` run would end the heading; escape a bare one.
+            if text.ends_with('#') && !text.ends_with("\\#") {
                 text.pop();
                 text.push_str("\\#");
             }
             format!("{} {}", "#".repeat(*level as usize), text)
         }
-        BlockKind::List { ordered, items } => list_md(*ordered, items),
-        BlockKind::TaskList { items } => list_md(false, items),
+        BlockKind::List { ordered, items } => list_md(*ordered, items, marks),
+        BlockKind::TaskList { items } => list_md(false, items, marks),
         BlockKind::BlockQuote { children } => {
             let body = children.iter().map(kind_md).collect::<Vec<_>>().join("\n\n");
             body.split('\n')
@@ -61,12 +84,13 @@ pub(crate) fn kind_md(kind: &BlockKind) -> String {
             let nl = if yaml.is_empty() { "" } else { "\n" };
             format!("---\n{yaml}{nl}---")
         }
+        BlockKind::MathBlock { tex } if tex.is_empty() => "$$\n$$".to_string(),
         BlockKind::MathBlock { tex } => format!("$$\n{tex}\n$$"),
         BlockKind::Opaque { .. } => String::new(),
     }
 }
 
-fn list_md(ordered: bool, items: &[ListItem]) -> String {
+fn list_md(ordered: bool, items: &[ListItem], marks: Marks) -> String {
     let width = if ordered { 4 } else { 2 };
     let mut counters: Vec<usize> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
@@ -77,11 +101,12 @@ fn list_md(ordered: bool, items: &[ListItem]) -> String {
             counters.push(0);
         }
         counters[d] += 1;
+        let bullet = marks.bullet;
         let marker = match item.checked {
-            Some(true) => "- [x] ".to_string(),
-            Some(false) => "- [ ] ".to_string(),
-            None if ordered => format!("{}. ", counters[d]),
-            None => "- ".to_string(),
+            Some(true) => format!("{bullet} [x] "),
+            Some(false) => format!("{bullet} [ ] "),
+            None if ordered => format!("{}{} ", counters[d], marks.delim),
+            None => format!("{bullet} "),
         };
         let indent = " ".repeat(d * width);
         let cont = " ".repeat(d * width + marker.len());
@@ -174,6 +199,11 @@ pub(crate) fn inline_md(runs: &[Run]) -> String {
         }
     }
     emit(&mut out, &mut open, &mut line_start, &[], Md::Text(String::new()));
+    // A trailing space or tab would be stripped when the paragraph is read back.
+    if out.ends_with(' ') || out.ends_with('\t') {
+        let ws = out.pop().unwrap_or(' ');
+        out.push_str(if ws == ' ' { "&#32;" } else { "&#9;" });
+    }
     out
 }
 
@@ -294,12 +324,10 @@ fn escape_plain(text: &str, line_start: &mut bool) -> String {
             out.push('\n');
             continue;
         }
-        if at_start && c == ' ' {
-            out.push_str("&#32;");
-            continue;
-        }
-        if at_start && c == '\t' {
-            out.push_str("&#9;");
+        // Spaces and tabs are dropped at a line start and at a line end.
+        let at_line_end = cs.get(i + 1) == Some(&'\n');
+        if (at_start || at_line_end) && (c == ' ' || c == '\t') {
+            out.push_str(if c == ' ' { "&#32;" } else { "&#9;" });
             continue;
         }
         if at_start && c.is_ascii_digit() && number_end.is_none() {

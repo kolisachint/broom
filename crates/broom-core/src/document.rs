@@ -169,7 +169,11 @@ impl Document {
     }
 
     fn block_line_count(&self, b: usize) -> usize {
-        self.visible_text(b).map_or(1, |t| t.matches('\n').count() + 1)
+        match self.blocks.get(b).map(|blk| &blk.kind) {
+            Some(BlockKind::Opaque { .. }) => self.blocks[b].source.matches('\n').count() + 1,
+            Some(kind) => kind.newline_count() + 1,
+            None => 1,
+        }
     }
 
     /// Block index and line index inside that block, for a global line.
@@ -646,6 +650,27 @@ mod edit_tests {
     }
 
     #[test]
+    fn math_blocks_refuse_blank_lines_and_dollars() {
+        let mut doc = Document::parse("$$\nx\n$$\n");
+        assert!(matches!(doc.insert_text(at(0, 1), "\n"), Err(EditError::Unsupported(_))));
+        assert!(matches!(doc.insert_text(at(0, 0), "$$"), Err(EditError::Unsupported(_))));
+        doc.insert_text(at(0, 1), "y").unwrap();
+        assert_eq!(doc.to_markdown(), "$$\nxy\n$$\n");
+    }
+
+    #[test]
+    fn newline_count_matches_visible_text() {
+        let doc = Document::parse(crate::document::fuzz_tests::SAMPLE);
+        for i in 0..doc.block_count() {
+            let text = doc.visible_text(i).unwrap();
+            let kind_nl = doc.block(i).unwrap().kind().newline_count();
+            if !matches!(doc.block(i).unwrap().kind(), BlockKind::Opaque { .. }) {
+                assert_eq!(kind_nl, text.matches('\n').count(), "block {i}");
+            }
+        }
+    }
+
+    #[test]
     fn new_edit_clears_redo() {
         let mut doc = Document::parse("a\n");
         doc.insert_text(at(0, 1), "b").unwrap();
@@ -857,10 +882,16 @@ mod fuzz_tests {
     }
 
     /// What a reader sees: per block, visible text and block kind.
+    /// Documented exception: an empty paragraph has no markdown form (its
+    /// blank lines read back as spacing), so empty paragraphs are not compared.
     fn semantics(doc: &Document) -> Vec<(String, std::mem::Discriminant<BlockKind>)> {
         doc.blocks()
             .iter()
             .enumerate()
+            .filter(|(i, b)| {
+                !(matches!(b.kind(), BlockKind::Paragraph { .. })
+                    && doc.visible_text(*i).is_some_and(|t| t.is_empty()))
+            })
             .map(|(i, b)| {
                 (
                     doc.visible_text(i).unwrap_or_default(),
@@ -869,6 +900,8 @@ mod fuzz_tests {
             })
             .collect()
     }
+
+    pub(crate) const SAMPLE: &str = "# Title\n\nPara with **bold** and [[Note|x]].\n\n- a\n- [ ] b\n  - c\n\n> q\n> r\n\n```\ncode\n```\n\n| h | i |\n|---|:-:|\n| 1 | 2 |\n\n---\n\n$$\nx\n$$\n\n<div>raw</div>\n\nfoo\n\n> a\n>\n> b\n";
 
     /// Property: re-parsing the saved markdown gives the same visible text and kinds.
     pub(crate) fn assert_reparse_matches(doc: &Document) {
@@ -960,8 +993,9 @@ mod fuzz_tests {
     }
 
     /// Safety net for every edit: the saved markdown must read back the same.
+    /// Ignored: adjacent-list marker edge case still open (see report).
     #[test]
-    #[ignore = "property: enable once the reparse blockers are fixed"]
+    #[ignore = "open: adjacent bullet-list marker edge case"]
     fn reparse_matches_after_random_edits() {
         random_sessions(40, 150, true);
     }
