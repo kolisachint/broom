@@ -19,6 +19,7 @@
 pub mod buffer;
 pub mod key;
 pub mod machine;
+pub mod motion;
 #[cfg(test)]
 mod mock;
 
