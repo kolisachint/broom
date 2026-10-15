@@ -993,9 +993,7 @@ mod fuzz_tests {
     }
 
     /// Safety net for every edit: the saved markdown must read back the same.
-    /// Ignored: adjacent-list marker edge case still open (see report).
     #[test]
-    #[ignore = "open: adjacent bullet-list marker edge case"]
     fn reparse_matches_after_random_edits() {
         random_sessions(40, 150, true);
     }

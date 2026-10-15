@@ -72,8 +72,8 @@ impl Document {
                 _ => (None, None),
             }
         };
-        let (prev_b, prev_d) = marker_of(i.checked_sub(1));
-        let (next_b, next_d) = marker_of(Some(i + 1));
+        let (prev_b, prev_d) = marker_of(self.prev_content(i));
+        let (next_b, next_d) = marker_of(self.next_content(i));
         let mut marks = Marks::default();
         // Pick a bullet that neither neighbouring list uses.
         if let Some(free) = ['-', '*', '+']
@@ -115,6 +115,22 @@ impl Document {
         self.write_block(i);
         // A neighbouring bullet list with the same marker would merge with this one.
         self.fix_list_markers();
+    }
+
+    /// Whether block `j` is a paragraph with no text. Blank lines between two
+    /// lists are such a block, and they do not separate the lists.
+    fn is_blank_paragraph(&self, j: usize) -> bool {
+        matches!(&self.blocks[j].kind, BlockKind::Paragraph { content } if runs::char_len(content) == 0)
+    }
+
+    /// Index of the nearest block before `i` that is not a blank paragraph.
+    fn prev_content(&self, i: usize) -> Option<usize> {
+        (0..i).rev().find(|&j| !self.is_blank_paragraph(j))
+    }
+
+    /// Index of the nearest block after `i` that is not a blank paragraph.
+    fn next_content(&self, i: usize) -> Option<usize> {
+        (i + 1..self.blocks.len()).find(|&j| !self.is_blank_paragraph(j))
     }
 
     /// The bullet character a bullet list's source starts with.
@@ -224,8 +240,11 @@ impl Document {
     /// Re-serializes the second of every adjacent pair of bullet lists that share
     /// a marker. Such lists would read back as one list.
     fn fix_list_markers(&mut self) {
-        for j in 1..self.blocks.len() {
-            if self.bullet_marker(j).is_some() && self.bullet_marker(j) == self.bullet_marker(j - 1) {
+        for j in 0..self.blocks.len() {
+            let Some(prev) = self.prev_content(j) else {
+                continue;
+            };
+            if self.bullet_marker(j).is_some() && self.bullet_marker(j) == self.bullet_marker(prev) {
                 self.write_block(j);
             }
         }
