@@ -5,7 +5,8 @@
 
 use crate::ConfigError;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Settings. Field names are the TOML keys.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,32 +55,60 @@ impl Settings {
         }
     }
 
-    /// Like [`Settings::load`], but never fails. A malformed file gives the
-    /// defaults plus the parse error, so the UI can report it and carry on.
-    pub fn load_or_default(path: &Path) -> (Settings, Option<ConfigError>) {
-        match Settings::load(path) {
-            Ok(settings) => (settings, None),
-            Err(e) => (Settings::default(), Some(e)),
-        }
-    }
-
     /// Writes the settings to `path` as TOML. Creates the parent directory.
-    /// The write goes to a temp file first, then renames it, so a hot-reload
-    /// watcher never sees a half-written file.
+    ///
+    /// Writes through symlinks: the link stays, and its target is replaced.
+    /// The text goes to a uniquely named temp file beside the target, then is
+    /// renamed over it, so a hot-reload watcher never sees a half-written file.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir)?;
-        }
-        let file_name = path
+        let target = resolve_target(path)?;
+        let dir = target
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let name = target
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "settings.toml".to_string());
-        let tmp = path.with_file_name(format!(".{file_name}.tmp"));
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, path)?;
+        let tmp = dir.join(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            next_temp_id()
+        ));
+
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &target)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
+}
+
+/// The file that `save` should write: `path` itself, or the target of a symlink.
+/// A dangling symlink is an error, so the link is never replaced by accident.
+fn resolve_target(path: &Path) -> Result<PathBuf, ConfigError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Ok(std::fs::canonicalize(path)?),
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Distinct id for each temp file in this process.
+fn next_temp_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -172,24 +201,6 @@ vim_enabled = true
     }
 
     #[test]
-    fn load_or_default_falls_back_and_reports() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = write(dir.path(), "font_size = = 16\n");
-        let (s, problem) = Settings::load_or_default(&path);
-        assert_eq!(s, Settings::default());
-        assert!(matches!(problem, Some(ConfigError::Parse(_))));
-    }
-
-    #[test]
-    fn load_or_default_is_silent_when_ok() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = write(dir.path(), "font_size = 18.0\n");
-        let (s, problem) = Settings::load_or_default(&path);
-        assert_eq!(s.font_size, 18.0);
-        assert!(problem.is_none());
-    }
-
-    #[test]
     fn save_then_load_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nested").join("settings.toml");
@@ -237,5 +248,56 @@ vim_enabled = true
         ] {
             assert!(text.contains(key), "missing `{key}` in:\n{text}");
         }
+    }
+
+    #[test]
+    fn bad_file_is_an_error_so_callers_keep_their_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(dir.path(), "font_size = = 16\n");
+        assert!(Settings::load(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "").expect("seed");
+        let link = dir.path().join("settings.toml");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let settings = Settings {
+            font_size: 21.0,
+            ..Settings::default()
+        };
+        settings.save(&link).expect("save through link");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(Settings::load(&real).expect("real file").font_size, 21.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_dangling_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("settings.toml");
+        std::os::unix::fs::symlink(dir.path().join("missing.toml"), &link).expect("symlink");
+        assert!(Settings::default().save(&link).is_err());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn temp_names_are_unique_per_save() {
+        assert_ne!(next_temp_id(), next_temp_id());
     }
 }

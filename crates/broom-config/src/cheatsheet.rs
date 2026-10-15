@@ -18,6 +18,8 @@ pub const SECTION_VIM_SEQUENCES: &str = "Vim: normal mode";
 pub const SECTION_VIM_TREE: &str = "Vim: file tree";
 /// Section for commands with no shortcut.
 pub const SECTION_UNBOUND: &str = "No shortcut yet";
+/// Section for keys that work only in text fields.
+pub const SECTION_TEXT_INPUT: &str = "In text fields";
 
 /// One line of the cheatsheet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,7 @@ pub fn cheatsheet(keymap: &Keymap) -> Vec<CheatsheetEntry> {
         (Context::Global, SECTION_EVERYWHERE),
         (Context::Editor, SECTION_EDITOR),
         (Context::Tree, SECTION_TREE),
+        (Context::TextInput, SECTION_TEXT_INPUT),
     ] {
         for binding in keymap.bindings.iter().filter(|b| b.context == context) {
             rows.push(entry(
@@ -68,14 +71,7 @@ pub fn cheatsheet(keymap: &Keymap) -> Vec<CheatsheetEntry> {
         ));
     }
     for (key, command) in VIM_TREE_KEYS {
-        let chord = Chord {
-            cmd: false,
-            ctrl: false,
-            alt: false,
-            shift: false,
-            key: (*key).to_string(),
-        };
-        rows.push(entry(SECTION_VIM_TREE, chord.label(), *command));
+        rows.push(entry(SECTION_VIM_TREE, (*key).to_string(), *command));
     }
 
     let listed: Vec<Command> = rows.iter().map(|r| r.command).collect();
@@ -256,7 +252,7 @@ mod tests {
             && r.keys == "g then d"));
         assert!(rows.iter().any(|r| r.section == SECTION_VIM_TREE
             && r.command == Command::TreeDelete
-            && r.keys == "D"));
+            && r.keys == "d"));
     }
 
     #[test]

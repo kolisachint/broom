@@ -38,4 +38,6 @@ pub enum ConfigError {
     InvalidChord(String),
     #[error("unknown command `{0}`")]
     UnknownCommand(String),
+    #[error("unknown context `{0}` (use global, editor, tree or text_input)")]
+    UnknownContext(String),
 }

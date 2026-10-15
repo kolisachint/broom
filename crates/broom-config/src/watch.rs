@@ -1,8 +1,8 @@
 //! Hot reload. Watches the config directory and reports which file changed.
 //!
-//! The UI reloads by calling [`crate::Settings::load_or_default`] or
-//! [`crate::Keymap::load_lenient`] when it receives a [`ConfigChange`]. Parse
-//! errors are reported to the user and the previous config is kept.
+//! When a [`ConfigChange`] arrives, reload with [`crate::Settings::load`] or
+//! [`crate::Keymap::load_lenient`]. On `Err`, keep the previous config and
+//! report the error. Never replace it with defaults.
 
 use notify::event::EventKind;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};

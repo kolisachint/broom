@@ -21,15 +21,37 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Where a binding applies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Context {
-    /// Everywhere. Lowest priority.
+    /// Everywhere. Lowest priority. Not seen from [`Context::TextInput`].
     Global,
     /// Focus is in the editor.
     Editor,
     /// Focus is in the file tree.
     Tree,
+    /// A text field (rename box, search box). Only TextInput bindings apply,
+    /// so Global and Editor keys such as Cmd+B do nothing here and the field
+    /// keeps the platform keys.
+    TextInput,
+}
+
+impl Context {
+    /// Parses a context name from `keymap.toml`. Case-insensitive, and `_` and
+    /// `-` are ignored, so `"Editor"`, `"text_input"` and `"TextInput"` all work.
+    pub fn from_name(name: &str) -> Option<Context> {
+        let key = name
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        match key.as_str() {
+            "global" => Some(Context::Global),
+            "editor" => Some(Context::Editor),
+            "tree" => Some(Context::Tree),
+            "textinput" => Some(Context::TextInput),
+            _ => None,
+        }
+    }
 }
 
 /// One key press: modifiers plus a key name.
@@ -63,29 +85,67 @@ const KEY_NAMES: &[(&str, &str)] = &[
     ("pagedown", "pagedown"),
 ];
 
-/// Normalizes one key token. `None` when the token is not a valid key.
-fn normalize_key(token: &str) -> Option<String> {
+/// Shifted punctuation and the key it sits on (US layout). `?` is `/` + shift.
+const SHIFTED_PUNCTUATION: &[(char, char)] = &[
+    ('!', '1'),
+    ('@', '2'),
+    ('#', '3'),
+    ('$', '4'),
+    ('%', '5'),
+    ('^', '6'),
+    ('&', '7'),
+    ('*', '8'),
+    ('(', '9'),
+    (')', '0'),
+    ('_', '-'),
+    ('+', '='),
+    ('{', '['),
+    ('}', ']'),
+    (':', ';'),
+    ('"', '\''),
+    ('<', ','),
+    ('>', '.'),
+    ('?', '/'),
+    ('~', '`'),
+    ('|', '\\'),
+];
+
+/// Normalizes one key token. Returns the key and whether the token implies
+/// shift (`?` implies shift on `/`). `None` when the token is not a valid key.
+fn normalize_key(token: &str) -> Option<(String, bool)> {
     let lower = token.to_ascii_lowercase();
     if let Some((_, name)) = KEY_NAMES.iter().find(|(n, _)| *n == lower) {
-        return Some((*name).to_string());
+        return Some(((*name).to_string(), false));
     }
     if let Some(num) = lower.strip_prefix('f').and_then(|n| n.parse::<u8>().ok())
         && (1..=12).contains(&num)
     {
-        return Some(format!("f{num}"));
+        return Some((format!("f{num}"), false));
     }
     let mut chars = token.chars();
     let c = chars.next()?;
     if chars.next().is_some() {
         return None;
     }
+    if let Some((_, base)) = SHIFTED_PUNCTUATION.iter().find(|(s, _)| *s == c) {
+        return Some((base.to_string(), true));
+    }
     if c.is_alphabetic() {
-        Some(c.to_lowercase().collect())
+        Some((c.to_lowercase().collect(), false))
     } else if !c.is_whitespace() && !c.is_control() {
-        Some(c.to_string())
+        Some((c.to_string(), false))
     } else {
         None
     }
+}
+
+/// The shifted character for a base key, for labels: `"/"` gives `?`.
+/// Digits are left alone, so `Shift+1` stays `Shift+1`.
+fn shifted_glyph(key: &str) -> Option<char> {
+    SHIFTED_PUNCTUATION
+        .iter()
+        .find(|(_, base)| !base.is_ascii_digit() && base.to_string() == key)
+        .map(|(shifted, _)| *shifted)
 }
 
 impl Chord {
@@ -107,13 +167,13 @@ impl Chord {
             text.rsplit_once('+').unwrap_or(("", text))
         };
 
-        let key = normalize_key(key).ok_or_else(invalid)?;
+        let (key, implied_shift) = normalize_key(key).ok_or_else(invalid)?;
 
         let mut chord = Chord {
             cmd: false,
             ctrl: false,
             alt: false,
-            shift: false,
+            shift: implied_shift,
             key,
         };
         if !mods.is_empty() {
@@ -135,7 +195,28 @@ impl Chord {
         Ok(chord)
     }
 
+    /// Builds a chord from a key the UI read, plus modifier flags. `key` is the
+    /// base key (`"/"` with shift held) or the character it made (`"?"`). Both
+    /// give the same chord. `None` for an unknown key.
+    pub fn from_keystroke(
+        key: &str,
+        cmd: bool,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    ) -> Option<Chord> {
+        let (key, implied_shift) = normalize_key(key)?;
+        Some(Chord {
+            cmd,
+            ctrl,
+            alt,
+            shift: shift || implied_shift,
+            key,
+        })
+    }
+
     /// Human-readable label for the cheatsheet, for example `"Cmd+Shift+P"`.
+    /// Shift on punctuation reads as the character it makes: `Ctrl+Shift+/` is `"Ctrl+?"`.
     pub fn label(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.cmd {
@@ -147,10 +228,15 @@ impl Chord {
         if self.alt {
             parts.push("Alt".to_string());
         }
-        if self.shift {
-            parts.push("Shift".to_string());
+        match shifted_glyph(&self.key) {
+            Some(glyph) if self.shift => parts.push(glyph.to_string()),
+            _ => {
+                if self.shift {
+                    parts.push("Shift".to_string());
+                }
+                parts.push(key_label(&self.key));
+            }
         }
-        parts.push(key_label(&self.key));
         parts.join("+")
     }
 }
@@ -287,7 +373,6 @@ impl Keymap {
         bind(&mut b, Global, "cmd+k z", ZenMode);
         bind(&mut b, Global, "ctrl+?", Cheatsheet);
         bind(&mut b, Global, "ctrl+-", Back);
-        bind(&mut b, Global, "ctrl+shift+-", Forward);
 
         // Editor. These shadow the Global chords of the same keys.
         bind(&mut b, Editor, "cmd+b", Bold);
@@ -335,36 +420,30 @@ impl Keymap {
 
     /// Reads `path` and applies its `[[bind]]` entries over [`Keymap::defaults`].
     /// A user binding with the same context and chords replaces the default.
+    /// `command = "none"` (or `unbind = true`) removes a default instead.
     /// A missing file gives the defaults.
     ///
-    /// Strict: the first problem (bad TOML, bad chord, unknown command) is an
-    /// error. Use [`Keymap::load_lenient`] to keep the good lines.
+    /// Strict: the first bad line is an error. For hot reload, keep the
+    /// previous keymap on `Err`. [`Keymap::load_lenient`] keeps the good lines.
     pub fn load(path: &Path) -> Result<Keymap, ConfigError> {
-        let mut keymap = Keymap::defaults();
-        if let Some(text) = read_optional(path)? {
-            let problems = apply_user_text(&mut keymap, &text)?;
-            if let Some(first) = problems.into_iter().next() {
-                return Err(first);
-            }
+        let (keymap, problems) = Keymap::load_lenient(path)?;
+        match problems.into_iter().next() {
+            Some(first) => Err(first),
+            None => Ok(keymap),
         }
-        Ok(keymap)
     }
 
-    /// Like [`Keymap::load`], but never fails. Bad lines are skipped and
-    /// reported. A file that is not valid TOML gives the defaults and one
-    /// report. Use the reports to tell the user; keep the returned keymap.
-    pub fn load_lenient(path: &Path) -> (Keymap, Vec<ConfigError>) {
+    /// Like [`Keymap::load`], but a bad `[[bind]]` line is skipped and returned
+    /// in the `Vec` instead of failing. Returns `Err` only when the file cannot
+    /// be read or is not valid TOML. On `Err`, keep the previous keymap; do not
+    /// fall back to defaults.
+    pub fn load_lenient(path: &Path) -> Result<(Keymap, Vec<ConfigError>), ConfigError> {
         let mut keymap = Keymap::defaults();
-        let mut problems = Vec::new();
-        match read_optional(path) {
-            Ok(None) => {}
-            Ok(Some(text)) => match apply_user_text(&mut keymap, &text) {
-                Ok(list) => problems = list,
-                Err(e) => problems.push(e),
-            },
-            Err(e) => problems.push(e),
-        }
-        (keymap, problems)
+        let problems = match read_optional(path)? {
+            Some(text) => apply_user_text(&mut keymap, &text)?,
+            None => Vec::new(),
+        };
+        Ok((keymap, problems))
     }
 
     /// Looks up `sequence` in `ctx`, then in `Context::Global`.
@@ -401,14 +480,19 @@ impl Keymap {
                 .find(|b| b.context == wanted && b.chords == sequence)
                 .map(|b| b.command)
         };
-        search(ctx).or_else(|| search(Context::Global))
+        let fallback = if ctx == Context::TextInput {
+            None
+        } else {
+            search(Context::Global)
+        };
+        search(ctx).or(fallback)
     }
 
-    /// Bindings that apply in `ctx`: its own, then `Global`.
+    /// Bindings that apply in `ctx`: its own, then `Global` (not in TextInput).
     fn visible(&self, ctx: Context) -> impl Iterator<Item = &Binding> {
-        self.bindings
-            .iter()
-            .filter(move |b| b.context == ctx || b.context == Context::Global)
+        self.bindings.iter().filter(move |b| {
+            b.context == ctx || (b.context == Context::Global && ctx != Context::TextInput)
+        })
     }
 }
 
@@ -421,24 +505,28 @@ pub(crate) fn read_optional(path: &Path) -> Result<Option<String>, ConfigError> 
     }
 }
 
-/// The shape of `keymap.toml`.
+/// The shape of `keymap.toml`. Each `[[bind]]` stays a raw value, so one bad
+/// line is reported and skipped without losing the others.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct KeymapFile {
-    bind: Vec<BindLine>,
+    bind: Vec<toml::Value>,
 }
 
-/// One `[[bind]]` entry.
+/// One `[[bind]]` entry. The context is a string, checked by [`Context::from_name`].
 #[derive(Deserialize)]
 struct BindLine {
     keys: String,
+    #[serde(default)]
     command: String,
-    #[serde(default = "default_context")]
-    context: Context,
+    #[serde(default = "default_context_name")]
+    context: String,
+    #[serde(default)]
+    unbind: bool,
 }
 
-fn default_context() -> Context {
-    Context::Global
+fn default_context_name() -> String {
+    "global".to_string()
 }
 
 /// Applies the `[[bind]]` entries in `text` over `keymap`.
@@ -448,26 +536,41 @@ fn default_context() -> Context {
 fn apply_user_text(keymap: &mut Keymap, text: &str) -> Result<Vec<ConfigError>, ConfigError> {
     let file: KeymapFile = toml::from_str(text)?;
     let mut problems = Vec::new();
-    for line in file.bind {
-        let parsed = parse_sequence(&line.keys).and_then(|chords| {
-            let command = Command::from_name(&line.command)?;
-            Ok(Binding {
-                context: line.context,
-                chords,
-                command,
-            })
-        });
-        match parsed {
-            Ok(binding) => {
-                keymap
-                    .bindings
-                    .retain(|b| !(b.context == binding.context && b.chords == binding.chords));
-                keymap.bindings.push(binding);
+    for value in file.bind {
+        match value.try_into::<BindLine>() {
+            Ok(line) => {
+                if let Err(e) = apply_line(keymap, &line) {
+                    problems.push(e);
+                }
             }
-            Err(e) => problems.push(e),
+            Err(e) => problems.push(ConfigError::Parse(e)),
         }
     }
     Ok(problems)
+}
+
+/// Applies one bind line. Everything is validated before the keymap changes,
+/// so a bad line never removes a default.
+fn apply_line(keymap: &mut Keymap, line: &BindLine) -> Result<(), ConfigError> {
+    let context = Context::from_name(&line.context)
+        .ok_or_else(|| ConfigError::UnknownContext(line.context.clone()))?;
+    let chords = parse_sequence(&line.keys)?;
+    let command = if line.unbind || line.command == "none" {
+        None
+    } else {
+        Some(Command::from_name(&line.command)?)
+    };
+    keymap
+        .bindings
+        .retain(|b| !(b.context == context && b.chords == chords));
+    if let Some(command) = command {
+        keymap.bindings.push(Binding {
+            context,
+            chords,
+            command,
+        });
+    }
+    Ok(())
 }
 
 /// How long a partial sequence waits for its next key (SPEC: 800 ms).
@@ -548,7 +651,33 @@ impl SequenceState {
     }
 
     /// Handles one chord pressed at `now` in `ctx`.
-    pub fn press(&mut self, keymap: &Keymap, ctx: Context, chord: Chord, now: Instant) -> KeyStep {
+    ///
+    /// `is_repeat` is true for OS key-repeat events (a held key). A repeat
+    /// never starts or extends a sequence, so holding Cmd+K does not arm
+    /// InsertLink. It is ignored while a sequence is pending. Repeats of
+    /// single-chord commands (arrow keys in the tree) still run. The UI should
+    /// pass the OS repeat flag through unchanged.
+    pub fn press(
+        &mut self,
+        keymap: &Keymap,
+        ctx: Context,
+        chord: Chord,
+        now: Instant,
+        is_repeat: bool,
+    ) -> KeyStep {
+        if is_repeat {
+            let starts_sequence = matches!(
+                keymap.lookup(ctx, std::slice::from_ref(&chord)),
+                KeyMatch::Prefix
+            );
+            if !self.pending.is_empty() || starts_sequence {
+                return KeyStep {
+                    flushed: None,
+                    outcome: KeyOutcome::Unhandled,
+                };
+            }
+        }
+
         let mut flushed = None;
         if self.is_expired(now) {
             flushed = self.flush(keymap, ctx);
@@ -649,11 +778,52 @@ mod tests {
     }
 
     #[test]
-    fn parses_ctrl_question_mark_without_shift() {
+    fn ctrl_question_mark_is_ctrl_shift_slash() {
         let c = chord("ctrl+?");
         assert!(c.ctrl);
-        assert!(!c.shift);
-        assert_eq!(c.key, "?");
+        assert!(c.shift);
+        assert_eq!(c.key, "/");
+        assert_eq!(c, chord("ctrl+shift+/"));
+    }
+
+    #[test]
+    fn shifted_punctuation_canonicalizes_to_base_key() {
+        assert_eq!(chord("cmd++"), chord("cmd+shift+="));
+        assert_eq!(chord("cmd+_"), chord("cmd+shift+-"));
+        assert_eq!(chord("cmd+{"), chord("cmd+shift+["));
+        assert_eq!(chord("cmd+:"), chord("cmd+shift+;"));
+        assert_eq!(chord("cmd+\""), chord("cmd+shift+'"));
+        assert_eq!(chord("cmd+|"), chord("cmd+shift+\\"));
+        assert_eq!(chord("cmd+<"), chord("cmd+shift+,"));
+        assert_eq!(chord("cmd+~"), chord("cmd+shift+`"));
+        assert_eq!(chord("cmd+!"), chord("cmd+shift+1"));
+        assert_eq!(chord("+"), chord("shift+="));
+    }
+
+    #[test]
+    fn from_keystroke_accepts_base_key_or_produced_character() {
+        let want = chord("ctrl+shift+/");
+        assert_eq!(
+            Chord::from_keystroke("/", false, true, false, true),
+            Some(want.clone())
+        );
+        assert_eq!(
+            Chord::from_keystroke("?", false, true, false, false),
+            Some(want)
+        );
+        assert_eq!(
+            Chord::from_keystroke("1", true, false, false, true),
+            Some(chord("cmd+shift+1"))
+        );
+        assert_eq!(Chord::from_keystroke("", true, false, false, false), None);
+        assert_eq!(Chord::from_keystroke("ab", true, false, false, false), None);
+    }
+
+    #[test]
+    fn shifted_punctuation_labels_as_the_character() {
+        assert_eq!(chord("ctrl+shift+/").label(), "Ctrl+?");
+        assert_eq!(chord("cmd+shift+1").label(), "Cmd+Shift+1");
+        assert_eq!(chord("cmd+=").label(), "Cmd+=");
     }
 
     #[test]
@@ -673,8 +843,8 @@ mod tests {
         assert_eq!(chord("cmd+-").key, "-");
         assert_eq!(chord("cmd+/").key, "/");
         assert_eq!(chord("cmd+shift+1").key, "1");
-        assert_eq!(chord("cmd++").key, "+");
-        assert_eq!(chord("+").key, "+");
+        assert_eq!(chord("cmd++").key, "=");
+        assert_eq!(chord("+").key, "=");
     }
 
     #[test]
@@ -894,7 +1064,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let km = Keymap::load(&dir.path().join("nope.toml")).expect("missing is ok");
         assert_eq!(km, Keymap::defaults());
-        let (lenient, problems) = Keymap::load_lenient(&dir.path().join("nope.toml"));
+        let (lenient, problems) =
+            Keymap::load_lenient(&dir.path().join("nope.toml")).expect("missing ok");
         assert_eq!(lenient, Keymap::defaults());
         assert!(problems.is_empty());
     }
@@ -1046,7 +1217,7 @@ keys = "cmd+x"
 command = "Explode"
 "#,
         );
-        let (km, problems) = Keymap::load_lenient(&path);
+        let (km, problems) = Keymap::load_lenient(&path).expect("lenient");
         assert_eq!(problems.len(), 2);
         assert!(matches!(problems[0], ConfigError::InvalidChord(_)));
         assert!(matches!(problems[1], ConfigError::UnknownCommand(_)));
@@ -1057,12 +1228,14 @@ command = "Explode"
     }
 
     #[test]
-    fn lenient_load_of_bad_toml_gives_defaults_and_one_report() {
+    fn lenient_load_of_bad_toml_is_an_error_not_defaults() {
+        // Callers keep the previous keymap on Err. Defaults would silently drop user binds.
         let (_d, path) = temp_keymap("this is = = not toml");
-        let (km, problems) = Keymap::load_lenient(&path);
-        assert_eq!(km, Keymap::defaults());
-        assert_eq!(problems.len(), 1);
-        assert!(matches!(problems[0], ConfigError::Parse(_)));
+        assert!(matches!(
+            Keymap::load_lenient(&path),
+            Err(ConfigError::Parse(_))
+        ));
+        assert!(matches!(Keymap::load(&path), Err(ConfigError::Parse(_))));
     }
 
     // ---- sequence state machine ----
@@ -1077,7 +1250,7 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::new();
         let t0 = Instant::now();
-        let step = st.press(&km, Context::Editor, chord("cmd+b"), t0);
+        let step = st.press(&km, Context::Editor, chord("cmd+b"), t0, false);
         assert_eq!(step.outcome, KeyOutcome::Run(Command::Bold));
         assert_eq!(step.flushed, None);
         assert!(st.pending().is_empty());
@@ -1088,7 +1261,7 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::new();
         let t0 = Instant::now();
-        let step = st.press(&km, Context::Editor, chord("x"), t0);
+        let step = st.press(&km, Context::Editor, chord("x"), t0, false);
         assert_eq!(step.outcome, KeyOutcome::Unhandled);
         assert!(st.pending().is_empty());
     }
@@ -1098,11 +1271,11 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::new();
         let t0 = Instant::now();
-        let first = st.press(&km, Context::Editor, chord("cmd+k"), t0);
+        let first = st.press(&km, Context::Editor, chord("cmd+k"), t0, false);
         assert_eq!(first.outcome, KeyOutcome::Pending);
         assert_eq!(st.pending(), &[chord("cmd+k")]);
 
-        let second = st.press(&km, Context::Editor, chord("z"), at(t0, 500));
+        let second = st.press(&km, Context::Editor, chord("z"), at(t0, 500), false);
         assert_eq!(second.outcome, KeyOutcome::Run(Command::ZenMode));
         assert_eq!(second.flushed, None);
         assert!(st.pending().is_empty());
@@ -1113,7 +1286,7 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::new();
         let t0 = Instant::now();
-        st.press(&km, Context::Editor, chord("cmd+k"), t0);
+        st.press(&km, Context::Editor, chord("cmd+k"), t0, false);
 
         // Just before 800 ms: still waiting.
         assert_eq!(st.tick(&km, Context::Editor, at(t0, 799)), None);
@@ -1133,10 +1306,10 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::new();
         let t0 = Instant::now();
-        st.press(&km, Context::Editor, chord("cmd+k"), t0);
+        st.press(&km, Context::Editor, chord("cmd+k"), t0, false);
 
         // The timer never ticked. A late `b` is not part of Cmd+K.
-        let step = st.press(&km, Context::Editor, chord("b"), at(t0, 900));
+        let step = st.press(&km, Context::Editor, chord("b"), at(t0, 900), false);
         assert_eq!(step.flushed, Some(Command::InsertLink));
         assert_eq!(step.outcome, KeyOutcome::Unhandled);
         assert!(st.pending().is_empty());
@@ -1147,10 +1320,10 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::new();
         let t0 = Instant::now();
-        st.press(&km, Context::Editor, chord("cmd+k"), t0);
+        st.press(&km, Context::Editor, chord("cmd+k"), t0, false);
 
         // Cmd+K then Cmd+B: the sequence breaks. Insert link runs, Bold runs.
-        let step = st.press(&km, Context::Editor, chord("cmd+b"), at(t0, 100));
+        let step = st.press(&km, Context::Editor, chord("cmd+b"), at(t0, 100), false);
         assert_eq!(step.flushed, Some(Command::InsertLink));
         assert_eq!(step.outcome, KeyOutcome::Run(Command::Bold));
     }
@@ -1160,10 +1333,10 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::new();
         let t0 = Instant::now();
-        st.press(&km, Context::Editor, chord("cmd+k"), t0);
+        st.press(&km, Context::Editor, chord("cmd+k"), t0, false);
 
         // `z` arrives after the timeout: InsertLink fires, `z` is plain text.
-        let step = st.press(&km, Context::Editor, chord("z"), at(t0, 1200));
+        let step = st.press(&km, Context::Editor, chord("z"), at(t0, 1200), false);
         assert_eq!(step.flushed, Some(Command::InsertLink));
         assert_eq!(step.outcome, KeyOutcome::Unhandled);
     }
@@ -1180,19 +1353,20 @@ command = "Explode"
         let mut st = SequenceState::new();
         let t0 = Instant::now();
         assert_eq!(
-            st.press(&km, Context::Global, chord("cmd+k"), t0).outcome,
+            st.press(&km, Context::Global, chord("cmd+k"), t0, false)
+                .outcome,
             KeyOutcome::Pending
         );
         // 600 ms later: `a` extends the sequence, and the clock restarts.
         assert_eq!(
-            st.press(&km, Context::Global, chord("a"), at(t0, 600))
+            st.press(&km, Context::Global, chord("a"), at(t0, 600), false)
                 .outcome,
             KeyOutcome::Pending
         );
         // 1 s after the start, but only 600 ms after `a`: still pending.
         assert_eq!(st.tick(&km, Context::Global, at(t0, 1000)), None);
         assert_eq!(
-            st.press(&km, Context::Global, chord("b"), at(t0, 1100))
+            st.press(&km, Context::Global, chord("b"), at(t0, 1100), false)
                 .outcome,
             KeyOutcome::Run(Command::Outline)
         );
@@ -1203,7 +1377,7 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::new();
         let t0 = Instant::now();
-        st.press(&km, Context::Editor, chord("cmd+k"), t0);
+        st.press(&km, Context::Editor, chord("cmd+k"), t0, false);
         st.cancel();
         assert!(st.pending().is_empty());
         assert_eq!(st.tick(&km, Context::Editor, at(t0, 5000)), None);
@@ -1214,7 +1388,7 @@ command = "Explode"
         let km = Keymap::defaults();
         let mut st = SequenceState::with_timeout(Duration::from_millis(100));
         let t0 = Instant::now();
-        st.press(&km, Context::Editor, chord("cmd+k"), t0);
+        st.press(&km, Context::Editor, chord("cmd+k"), t0, false);
         assert_eq!(st.tick(&km, Context::Editor, at(t0, 99)), None);
         assert_eq!(
             st.tick(&km, Context::Editor, at(t0, 100)),
@@ -1234,10 +1408,234 @@ command = "Explode"
         let mut st = SequenceState::new();
         let t0 = Instant::now();
         assert_eq!(
-            st.press(&km, Context::Tree, chord("cmd+k"), t0).outcome,
+            st.press(&km, Context::Tree, chord("cmd+k"), t0, false)
+                .outcome,
             KeyOutcome::Pending
         );
         assert_eq!(st.tick(&km, Context::Tree, at(t0, 800)), None);
         assert!(st.pending().is_empty());
+    }
+
+    // ---- regression: per-line validation, unbinding, text input, repeat ----
+
+    #[test]
+    fn context_name_is_case_insensitive() {
+        assert_eq!(Context::from_name("Editor"), Some(Context::Editor));
+        assert_eq!(Context::from_name("TREE"), Some(Context::Tree));
+        assert_eq!(Context::from_name("text_input"), Some(Context::TextInput));
+        assert_eq!(Context::from_name("text-input"), Some(Context::TextInput));
+        assert_eq!(Context::from_name("nowhere"), None);
+    }
+
+    #[test]
+    fn capitalized_context_in_file_is_accepted() {
+        let (_d, path) = temp_keymap(
+            r#"
+[[bind]]
+keys = "cmd+shift+q"
+command = "Outline"
+context = "Editor"
+"#,
+        );
+        let km = Keymap::load(&path).expect("Editor is valid");
+        assert_eq!(
+            km.lookup(Context::Editor, &seq("cmd+shift+q")),
+            KeyMatch::Exact(Command::Outline)
+        );
+    }
+
+    #[test]
+    fn one_bad_context_skips_only_that_line() {
+        let (_d, path) = temp_keymap(
+            r#"
+[[bind]]
+keys = "cmd+shift+q"
+command = "Outline"
+context = "Nowhere"
+
+[[bind]]
+keys = "cmd+shift+r"
+command = "Save"
+context = "Global"
+"#,
+        );
+        let (km, problems) = Keymap::load_lenient(&path).expect("file is valid TOML");
+        assert_eq!(problems.len(), 1);
+        assert!(matches!(problems[0], ConfigError::UnknownContext(ref c) if c == "Nowhere"));
+        assert_eq!(
+            km.lookup(Context::Global, &seq("cmd+shift+r")),
+            KeyMatch::Exact(Command::Save)
+        );
+        assert_eq!(
+            km.lookup(Context::Editor, &seq("cmd+b")),
+            KeyMatch::Exact(Command::Bold),
+            "defaults survive"
+        );
+    }
+
+    #[test]
+    fn wrong_type_line_is_skipped_and_others_kept() {
+        let (_d, path) = temp_keymap(
+            r#"
+[[bind]]
+keys = 5
+command = "Save"
+
+[[bind]]
+keys = "cmd+shift+r"
+command = "Outline"
+"#,
+        );
+        let (km, problems) = Keymap::load_lenient(&path).expect("valid TOML");
+        assert_eq!(problems.len(), 1);
+        assert!(matches!(problems[0], ConfigError::Parse(_)));
+        assert_eq!(
+            km.lookup(Context::Global, &seq("cmd+shift+r")),
+            KeyMatch::Exact(Command::Outline)
+        );
+    }
+
+    #[test]
+    fn bad_command_does_not_remove_the_default_it_targets() {
+        let (_d, path) = temp_keymap(
+            r#"
+[[bind]]
+keys = "cmd+b"
+command = "Explode"
+context = "global"
+"#,
+        );
+        let (km, problems) = Keymap::load_lenient(&path).expect("valid TOML");
+        assert_eq!(problems.len(), 1);
+        assert_eq!(
+            km.lookup(Context::Tree, &seq("cmd+b")),
+            KeyMatch::Exact(Command::ToggleTree),
+            "default must survive a line that failed validation"
+        );
+    }
+
+    #[test]
+    fn command_none_unbinds_a_default() {
+        let (_d, path) = temp_keymap(
+            r#"
+[[bind]]
+keys = "cmd+b"
+command = "none"
+context = "global"
+"#,
+        );
+        let km = Keymap::load(&path).expect("load");
+        assert_eq!(km.lookup(Context::Tree, &seq("cmd+b")), KeyMatch::None);
+        assert_eq!(
+            km.lookup(Context::Editor, &seq("cmd+b")),
+            KeyMatch::Exact(Command::Bold),
+            "only the Global binding is removed"
+        );
+    }
+
+    #[test]
+    fn unbind_true_also_unbinds() {
+        let (_d, path) = temp_keymap(
+            r#"
+[[bind]]
+keys = "cmd+s"
+unbind = true
+"#,
+        );
+        let km = Keymap::load(&path).expect("load");
+        assert_eq!(km.lookup(Context::Global, &seq("cmd+s")), KeyMatch::None);
+    }
+
+    #[test]
+    fn text_input_ignores_global_and_editor_bindings() {
+        let km = Keymap::defaults();
+        assert_eq!(km.lookup(Context::TextInput, &seq("cmd+b")), KeyMatch::None);
+        assert_eq!(km.lookup(Context::TextInput, &seq("cmd+s")), KeyMatch::None);
+        assert_eq!(km.exact(Context::TextInput, &seq("cmd+s")), None);
+    }
+
+    #[test]
+    fn text_input_sees_its_own_bindings() {
+        let (_d, path) = temp_keymap(
+            r#"
+[[bind]]
+keys = "cmd+enter"
+command = "Save"
+context = "text_input"
+"#,
+        );
+        let km = Keymap::load(&path).expect("load");
+        assert_eq!(
+            km.lookup(Context::TextInput, &seq("cmd+enter")),
+            KeyMatch::Exact(Command::Save)
+        );
+    }
+
+    #[test]
+    fn forward_has_no_default_chord() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            km.lookup(Context::Global, &seq("ctrl+shift+-")),
+            KeyMatch::None
+        );
+        assert!(km.bindings.iter().all(|b| b.command != Command::Forward));
+    }
+
+    #[test]
+    fn keeps_undo_redo_new_and_zoom_reset_defaults() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            km.lookup(Context::Editor, &seq("cmd+z")),
+            KeyMatch::Exact(Command::Undo)
+        );
+        assert_eq!(
+            km.lookup(Context::Editor, &seq("cmd+shift+z")),
+            KeyMatch::Exact(Command::Redo)
+        );
+        assert_eq!(
+            km.lookup(Context::Global, &seq("cmd+n")),
+            KeyMatch::Exact(Command::NewUntitled)
+        );
+        assert_eq!(
+            km.lookup(Context::Global, &seq("cmd+0")),
+            KeyMatch::Exact(Command::ZoomReset)
+        );
+    }
+
+    #[test]
+    fn repeat_does_not_start_a_sequence() {
+        let km = Keymap::defaults();
+        let mut st = SequenceState::new();
+        let t0 = Instant::now();
+        let step = st.press(&km, Context::Editor, chord("cmd+k"), t0, true);
+        assert_eq!(step.outcome, KeyOutcome::Unhandled);
+        assert!(st.pending().is_empty());
+        // A real press still starts it.
+        assert_eq!(
+            st.press(&km, Context::Editor, chord("cmd+k"), t0, false)
+                .outcome,
+            KeyOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn repeat_while_pending_is_ignored() {
+        let km = Keymap::defaults();
+        let mut st = SequenceState::new();
+        let t0 = Instant::now();
+        st.press(&km, Context::Editor, chord("cmd+k"), t0, false);
+        let step = st.press(&km, Context::Editor, chord("cmd+k"), at(t0, 100), true);
+        assert_eq!(step.flushed, None, "a repeat must not flush InsertLink");
+        assert_eq!(step.outcome, KeyOutcome::Unhandled);
+        assert_eq!(st.pending(), &[chord("cmd+k")]);
+    }
+
+    #[test]
+    fn repeat_of_single_chord_command_still_runs() {
+        let km = Keymap::defaults();
+        let mut st = SequenceState::new();
+        let t0 = Instant::now();
+        let step = st.press(&km, Context::Tree, chord("down"), t0, true);
+        assert_eq!(step.outcome, KeyOutcome::Run(Command::TreeDown));
     }
 }
