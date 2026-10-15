@@ -3,7 +3,8 @@
 //! Public methods in `document.rs` validate their arguments, record an undo
 //! step, and then call these. Functions here assume validated input.
 
-use crate::block::BlockKind;
+use crate::block::{Block, BlockKind};
+use crate::undo::{Snapshot, UNDO_LIMIT};
 use crate::document::Document;
 use crate::edit::EditError;
 use crate::inline::{Run, Style};
@@ -69,18 +70,48 @@ impl Document {
         b.edited = true;
     }
 
-    /// Records one undo step before a change. With `coalesce`, the change joins
-    /// the previous step unless a break was requested.
-    pub(crate) fn checkpoint(&mut self, cursor: DocPos, coalesce: bool) {
-        if !coalesce || self.undo.break_group || self.undo.undo.is_empty() {
-            self.undo.undo.push(crate::undo::Snapshot {
-                blocks: self.blocks.clone(),
+    /// Records one undo step before a change to blocks `lo..=hi`. With
+    /// `coalesce`, the change joins the previous step when it is a one-block
+    /// edit on the same block and nothing has broken the group.
+    pub(crate) fn checkpoint(&mut self, cursor: DocPos, coalesce: bool, lo: usize, hi: usize) {
+        let tail = self.blocks.len() - (hi + 1);
+        let mergeable = coalesce
+            && !self.undo.break_group
+            && lo == hi
+            && self
+                .undo
+                .undo
+                .last()
+                .is_some_and(|t| t.start == lo && t.tail == tail && t.old.len() == 1);
+        if !mergeable {
+            self.undo.undo.push(Snapshot {
+                start: lo,
+                tail,
+                old: self.blocks[lo..=hi].to_vec(),
                 cursor,
             });
+            if self.undo.undo.len() > UNDO_LIMIT {
+                self.undo.undo.remove(0);
+            }
         }
         self.undo.break_group = !coalesce;
         self.undo.redo.clear();
         self.revision += 1;
+    }
+
+    /// Puts a snapshot's blocks in place. Returns the snapshot that undoes this.
+    pub(crate) fn apply_snapshot(&mut self, step: Snapshot) -> Snapshot {
+        let len = self.blocks.len() - step.start - step.tail;
+        let cur: Vec<Block> = self
+            .blocks
+            .splice(step.start..step.start + len, step.old)
+            .collect();
+        Snapshot {
+            start: step.start,
+            tail: step.tail,
+            old: cur,
+            cursor: step.cursor,
+        }
     }
 
     /// Checks an insert of `text` at `pos`.
@@ -270,7 +301,7 @@ impl Document {
         let new_kind = slots::from_lines(&self.blocks[a].kind, &joined).ok_or_else(|| {
             EditError::Unsupported("the joined text cannot be shown in this block".into())
         })?;
-        self.checkpoint(DocPos::new(a, from), false);
+        self.checkpoint(DocPos::new(a, from), false, a, b);
         // The joined block is followed by what followed the last block.
         let after = trailing_of(&self.blocks[b].source).to_string();
         self.blocks.drain(a + 1..=b);

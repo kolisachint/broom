@@ -17,16 +17,22 @@ use crate::parse::parse_blocks;
 use crate::pos::{DocPos, DocRange};
 use crate::runs;
 use crate::slots;
-use crate::undo::{Snapshot, UndoStack};
+use crate::undo::UndoStack;
 
 /// An editable markdown document.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Document {
     pub(crate) blocks: Vec<Block>,
     pub(crate) undo: UndoStack,
     // Incremented on every edit. `saved_revision` is the value at the last save.
     pub(crate) revision: u64,
     pub(crate) saved_revision: u64,
+}
+
+impl Clone for Document {
+    fn clone(&self) -> Document {
+        self.clone_without_history()
+    }
 }
 
 impl Document {
@@ -172,7 +178,7 @@ impl Document {
         if text.is_empty() {
             return Ok(pos);
         }
-        self.checkpoint(pos, false);
+        self.checkpoint(pos, false, pos.block, pos.block);
         Ok(self.insert_raw(pos, text))
     }
 
@@ -190,7 +196,7 @@ impl Document {
             return Ok(r.start);
         }
         if r.start.block == r.end.block {
-            self.checkpoint(r.start, false);
+            self.checkpoint(r.start, false, r.start.block, r.start.block);
             self.delete_in_block(r.start.block, r.start.offset, r.end.offset);
         } else {
             self.join_range(r.start.block, r.start.offset, r.end.block, r.end.offset)?;
@@ -241,7 +247,7 @@ impl Document {
             return Ok(());
         }
         let on = !self.all_have(&targets, style);
-        self.checkpoint(r.start, false);
+        self.checkpoint(r.start, false, r.start.block, r.end.block);
         self.map_targets(&targets, |s| runs::set_flag(s, style, on));
         Ok(())
     }
@@ -253,7 +259,7 @@ impl Document {
         if targets.is_empty() {
             return Ok(());
         }
-        self.checkpoint(r.start, false);
+        self.checkpoint(r.start, false, r.start.block, r.end.block);
         let url = url.map(str::to_string);
         self.map_targets(&targets, |s: &mut Style| {
             s.link = url.clone();
@@ -276,7 +282,7 @@ impl Document {
             return Err(EditError::Unsupported("heading level must be 1 to 6".into()));
         }
         let new_kind = slots::convert(&self.blocks[block].kind, kind)?;
-        self.checkpoint(DocPos::new(block, 0), false);
+        self.checkpoint(DocPos::new(block, 0), false, block, block);
         self.blocks[block].kind = new_kind;
         self.sync(block);
         Ok(())
@@ -287,7 +293,7 @@ impl Document {
     /// Returns the cursor at the start of the second half.
     pub fn split_block(&mut self, pos: DocPos) -> Result<DocPos, EditError> {
         self.validate_insert(pos, "\n")?;
-        self.checkpoint(pos, false);
+        self.checkpoint(pos, false, pos.block, pos.block);
         Ok(self.split_raw(pos))
     }
 
@@ -320,7 +326,7 @@ impl Document {
         for p in &mut parsed {
             p.edited = true;
         }
-        self.checkpoint(DocPos::new(block, 0), false);
+        self.checkpoint(DocPos::new(block, 0), false, block, block);
         self.blocks.splice(block..=block, parsed);
         Ok(())
     }
@@ -331,27 +337,33 @@ impl Document {
     /// if there is nothing to undo.
     pub fn undo(&mut self) -> Option<DocPos> {
         let step = self.undo.undo.pop()?;
-        let current = std::mem::replace(&mut self.blocks, step.blocks);
-        self.undo.redo.push(Snapshot {
-            blocks: current,
-            cursor: step.cursor,
-        });
+        let cursor = step.cursor;
+        let back = self.apply_snapshot(step);
+        self.undo.redo.push(back);
         self.undo.break_group = true;
         self.revision += 1;
-        Some(step.cursor)
+        Some(cursor)
     }
 
     /// Re-applies the last undone step. Returns the cursor, or `None`.
     pub fn redo(&mut self) -> Option<DocPos> {
         let step = self.undo.redo.pop()?;
-        let current = std::mem::replace(&mut self.blocks, step.blocks);
-        self.undo.undo.push(Snapshot {
-            blocks: current,
-            cursor: step.cursor,
-        });
+        let cursor = step.cursor;
+        let back = self.apply_snapshot(step);
+        self.undo.undo.push(back);
         self.undo.break_group = true;
         self.revision += 1;
-        Some(step.cursor)
+        Some(cursor)
+    }
+
+    /// Undo history is not part of a copy: a clone starts with an empty stack.
+    fn clone_without_history(&self) -> Document {
+        Document {
+            blocks: self.blocks.clone(),
+            undo: UndoStack::default(),
+            revision: self.revision,
+            saved_revision: self.saved_revision,
+        }
     }
 
     /// Forces the next edit to start a new undo step. Call on pause in typing,
@@ -516,6 +528,29 @@ mod edit_tests {
         doc.undo();
         assert_eq!(doc.to_markdown(), "");
         assert!(doc.undo().is_none());
+    }
+
+    #[test]
+    fn undo_stays_bounded_on_large_documents() {
+        let src: String = (0..20_000).map(|i| format!("p{i}\n\n")).collect();
+        let mut doc = Document::parse(&src);
+        for i in 0..300 {
+            doc.split_block(at(10 * i + i, 1)).unwrap();
+        }
+        assert_eq!(doc.undo.undo.len(), 300);
+        // Each step holds only the one block it changed.
+        assert!(doc.undo.undo.iter().all(|s| s.old.len() == 1));
+        let copy = doc.clone();
+        assert!(copy.undo.undo.is_empty(), "clone drops history");
+        assert_eq!(copy.to_markdown(), doc.to_markdown());
+        for _ in 0..300 {
+            doc.undo().unwrap();
+        }
+        assert_eq!(doc.to_markdown(), src);
+        for i in 0..1100 {
+            doc.insert_text(at(i % 20_000, 0), "x").unwrap();
+        }
+        assert_eq!(doc.undo.undo.len(), crate::undo::UNDO_LIMIT);
     }
 
     #[test]

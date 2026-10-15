@@ -99,7 +99,7 @@ pub(crate) fn insert_typed(
     if text == "\n"
         && let Some((lang, body)) = fence_at(&doc.blocks[pos.block].kind, pos.offset)
     {
-        doc.checkpoint(pos, false);
+        doc.checkpoint(pos, false, pos.block, pos.block);
         doc.blocks[pos.block].kind = BlockKind::CodeBlock { lang, text: body };
         doc.sync(pos.block);
         return Ok(InputRuleOutcome::BlockChanged {
@@ -119,7 +119,7 @@ pub(crate) fn insert_typed(
     let c = pos.offset + text.chars().count();
     let rule = detect(&probe, c);
     let coalesce = matches!(rule, None | Some(Rule::Started));
-    doc.checkpoint(pos, coalesce);
+    doc.checkpoint(pos, coalesce, pos.block, pos.block);
     doc.insert_raw(pos, text);
     let cursor = DocPos::new(pos.block, c);
     Ok(match rule {
