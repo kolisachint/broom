@@ -79,11 +79,21 @@ pub fn bind_keys(cx: &mut App) {
         .detach();
     }
     match load_keymap() {
-        Some(keymap) => cx.bind_keys(keymap.bindings.iter().map(binding)),
+        Some(keymap) => cx.bind_keys(ordered(&keymap.bindings)),
         None => cx.bind_keys(FALLBACK.iter().map(|(keys, cmd, ctx)| {
             KeyBinding::new(keys, Run(*cmd), Some(ctx.unwrap_or(NOT_TEXT_INPUT)))
         })),
     }
+}
+
+/// GPUI bindings in registration order. Single-chord bindings come first and
+/// sequences after them. GPUI drops a pending prefix binding when an exact
+/// match was registered later than it. Without this order, Editor `cmd-k`
+/// (InsertLink) would hide Global `cmd-k z` (ZenMode) and fire at once.
+fn ordered(bindings: &[Binding]) -> Vec<KeyBinding> {
+    let mut sorted: Vec<&Binding> = bindings.iter().collect();
+    sorted.sort_by_key(|b| b.chords.len());
+    sorted.into_iter().map(binding).collect()
 }
 
 /// Converts one keymap binding to a GPUI binding.
@@ -350,5 +360,33 @@ mod tests {
         let typed = mac_keystroke(&cmd_shift_p);
         assert_eq!(typed.key, "p");
         assert!(typed.modifiers.shift && typed.modifiers.platform);
+    }
+
+    #[test]
+    fn zen_mode_binding_is_the_two_stroke_cmd_k_z() {
+        let km = Keymap::defaults();
+        let zen = km
+            .bindings
+            .iter()
+            .find(|b| b.command == broom_config::Command::ZenMode)
+            .expect("ZenMode is bound");
+        let text = zen
+            .chords
+            .iter()
+            .map(chord_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text, "cmd-k z");
+    }
+
+    #[test]
+    fn single_chords_are_registered_before_sequences() {
+        let km = Keymap::defaults();
+        let lens: Vec<usize> = super::ordered(&km.bindings)
+            .iter()
+            .map(|b| b.keystrokes().len())
+            .collect();
+        assert_eq!(lens.len(), km.bindings.len());
+        assert!(lens.windows(2).all(|w| w[0] <= w[1]), "{lens:?}");
     }
 }

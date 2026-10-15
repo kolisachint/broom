@@ -520,6 +520,15 @@ impl Editor {
         }
     }
 
+    /// Cmd+K: wraps the selection as a link with a placeholder URL. No selection, no-op.
+    fn insert_link(&mut self, cx: &mut Context<Self>) {
+        let Some(range) = self.selection_range() else {
+            return;
+        };
+        self.doc.break_undo_group();
+        self.set_link(range, "https://", cx);
+    }
+
     fn heading(&mut self, level: u8, cx: &mut Context<Self>) {
         let block = self.cursor.block;
         let Some(b) = self.doc.block(block) else {
@@ -647,6 +656,7 @@ impl Editor {
             Command::FollowLink => {
                 self.follow_link(cx);
             }
+            Command::InsertLink => self.insert_link(cx),
             _ => return false,
         }
         cx.notify();
