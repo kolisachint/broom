@@ -275,7 +275,7 @@ impl Render for FolderSearch {
             .pt(px(72.))
             .bg(rgba(0x00000040))
             .track_focus(&self.focus)
-            .key_context("FolderSearch")
+            .key_context("FolderSearch TextInput")
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
             .child(
                 div()

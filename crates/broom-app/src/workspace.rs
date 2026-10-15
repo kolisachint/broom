@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use broom_config::{Keymap, Settings, VimBindings, keymap_path, settings_path};
+use broom_config::{Settings, VimBindings, settings_path};
 use broom_core::Document;
 use broom_fs::{ConflictKind, RecoveryEntry};
 use broom_links::LinkIndex;
@@ -85,11 +85,8 @@ impl Workspace {
     /// Builds the root view. Each call into a library crate is guarded, so a
     /// `todo!()` stub shows as an empty pane and never stops the window.
     pub fn new(folder: PathBuf, cx: &mut Context<Self>) -> Workspace {
-        let settings = guarded("settings", || Settings::load(&settings_path()))
-            .and_then(Result::ok)
-            .unwrap_or_default();
-        let vim = guarded("keymap", || Keymap::load(&keymap_path()))
-            .and_then(Result::ok)
+        let settings = load_settings();
+        let vim = crate::keys::load_keymap()
             .map(|k| k.vim)
             .unwrap_or_else(empty_vim_bindings);
 
@@ -321,9 +318,9 @@ impl Workspace {
             return;
         }
         let md = editor.read(cx).markdown();
-        match guarded("save", || broom_fs::write_atomic(&path, &md)) {
-            Some(Ok(())) => {
-                self.safety.record(&path, &md);
+        match guarded("save", || broom_fs::write_atomic_stamped(&path, md.as_bytes())) {
+            Some(Ok(mtime)) => {
+                self.safety.record_stamp(&path, mtime, md.as_bytes());
                 self.safety.cancel_save(&path);
                 self.safety.discard_draft();
                 if let Some(index) = self.links.as_mut() {
@@ -598,6 +595,18 @@ impl Render for Workspace {
                     .occlude()
                     .child(dialog)
             }))
+    }
+}
+
+/// Loads the settings. A bad file is logged and the defaults are used.
+pub fn load_settings() -> Settings {
+    match guarded("settings", || Settings::load(&settings_path())) {
+        Some(Ok(settings)) => settings,
+        Some(Err(err)) => {
+            eprintln!("broom: settings: {err}");
+            Settings::default()
+        }
+        None => Settings::default(),
     }
 }
 

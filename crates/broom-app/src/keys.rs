@@ -21,6 +21,9 @@ use crate::workspace::{Workspace, guarded};
 #[action(no_json)]
 pub struct Run(pub Command);
 
+/// GPUI predicate for global bindings: every context except a text field.
+const NOT_TEXT_INPUT: &str = "!TextInput";
+
 /// Zoom step in points for Cmd+= and Cmd+-.
 const ZOOM_STEP: f32 = 1.0;
 
@@ -43,15 +46,26 @@ const FALLBACK: &[(&str, Command, Option<&str>)] = &[
     ("cmd-i", Command::Italic, Some("Editor")),
 ];
 
+/// Loads the user keymap leniently. Bad lines are logged and skipped. Falls
+/// back to the defaults. `None` when both fail (the library is still a stub).
+pub fn load_keymap() -> Option<Keymap> {
+    match guarded("keymap", || Keymap::load_lenient(&keymap_path())).and_then(Result::ok) {
+        Some((keymap, errors)) => {
+            for err in errors {
+                eprintln!("broom: keymap: {err}");
+            }
+            Some(keymap)
+        }
+        None => guarded("keymap defaults", Keymap::defaults),
+    }
+}
+
 /// Loads the keymap and registers every binding with GPUI. Call once at start.
 pub fn bind_keys(cx: &mut App) {
-    let keymap = guarded("keymap", || Keymap::load(&keymap_path()))
-        .and_then(Result::ok)
-        .or_else(|| guarded("keymap defaults", Keymap::defaults));
-    match keymap {
+    match load_keymap() {
         Some(keymap) => cx.bind_keys(keymap.bindings.iter().map(binding)),
         None => cx.bind_keys(FALLBACK.iter().map(|(keys, cmd, ctx)| {
-            KeyBinding::new(keys, Run(*cmd), *ctx)
+            KeyBinding::new(keys, Run(*cmd), Some(ctx.unwrap_or(NOT_TEXT_INPUT)))
         })),
     }
 }
@@ -84,12 +98,14 @@ fn chord_text(c: &Chord) -> String {
     out
 }
 
-/// Context predicate for a keymap scope. `None` means everywhere.
+/// Context predicate for a keymap scope. Global keys stay out of text
+/// fields, so Cmd+B does nothing in a rename box.
 fn context_of(scope: KeyScope) -> Option<&'static str> {
     match scope {
-        KeyScope::Global => None,
+        KeyScope::Global => Some(NOT_TEXT_INPUT),
         KeyScope::Editor => Some("Editor"),
         KeyScope::Tree => Some("Tree"),
+        KeyScope::TextInput => Some("TextInput"),
     }
 }
 

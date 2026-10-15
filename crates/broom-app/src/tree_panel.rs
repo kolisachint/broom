@@ -8,14 +8,14 @@
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use broom_config::{Keymap, Settings, VimBindings, keymap_path, settings_path};
+use broom_config::VimBindings;
 use broom_fs::{EntryKind, FileTree, TreeRow};
 use gpui_kit::*;
 
 use crate::editor::EditorStyle;
 use crate::tabs::{OpenConfig, Tabs, file_name};
 use crate::theme;
-use crate::workspace::{Workspace, guarded};
+use crate::workspace::{Workspace, guarded, load_settings};
 
 actions!(
     broom_tree,
@@ -31,8 +31,11 @@ actions!(
     ]
 );
 
-/// Context name used by the key bindings below.
-const KEY_CONTEXT: &str = "FileTree";
+/// Context name used by the key bindings below. Same name as the keymap's
+/// `Tree` scope.
+const KEY_CONTEXT: &str = "Tree";
+/// Added while a rename or new-file box is open, so tree keys stay out of it.
+const NAMING_CONTEXT: &str = "Tree TextInput";
 
 /// What the inline input is for.
 enum NameKind {
@@ -428,7 +431,11 @@ impl Render for TreeView {
             .gap_1()
             .bg(theme::color(theme::PANEL))
             .text_color(theme::color(theme::INK))
-            .key_context(KEY_CONTEXT)
+            .key_context(if self.naming.is_some() {
+                NAMING_CONTEXT
+            } else {
+                KEY_CONTEXT
+            })
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
             .on_action(cx.listener(|this, _: &TreeUp, _, cx| {
@@ -550,11 +557,8 @@ impl TreeView {
 /// Builds the tree panel and the tab strip, and sets them on the workspace.
 /// Called once from `Workspace::new`.
 pub fn install(ws: &mut Workspace, cx: &mut Context<Workspace>) {
-    let settings = guarded("settings", || Settings::load(&settings_path()))
-        .and_then(Result::ok)
-        .unwrap_or_default();
-    let vim = guarded("keymap", || Keymap::load(&keymap_path()))
-        .and_then(Result::ok)
+    let settings = load_settings();
+    let vim = crate::keys::load_keymap()
         .map(|k| k.vim)
         .unwrap_or_else(|| VimBindings {
             leader: Default::default(),

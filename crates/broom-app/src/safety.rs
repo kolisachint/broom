@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use broom_fs::{
     AutoSaver, Conflict, ConflictDetector, Recovery, RecoveryEntry, WatchEvent, Watcher,
@@ -38,7 +38,9 @@ impl Safety {
             AutoSaver::new(Duration::from_millis(delay_ms))
         });
         let conflicts = guarded("conflict check", ConflictDetector::new);
-        let recovery = recovery_dir.and_then(|dir| guarded("recovery", || Recovery::new(dir)));
+        let recovery = recovery_dir
+            .and_then(|dir| guarded("recovery", || Recovery::new(dir)))
+            .and_then(|r| r.map_err(|e| eprintln!("broom: recovery unavailable: {e}")).ok());
         let (watcher, events) = guarded("file watcher", Watcher::new)
             .and_then(Result::ok)
             .map_or((None, None), |(w, rx)| (Some(w), Some(rx)));
@@ -142,10 +144,18 @@ impl Safety {
         self.external_change(p)
     }
 
-    /// Stamps `path` with what broom just wrote or read.
+    /// Stamps `path` with what broom just read.
     pub fn record(&mut self, path: &Path, contents: &str) {
         if let Some(d) = self.conflicts.as_mut() {
             let _ = guarded("conflict record", || d.record(path, contents));
+        }
+    }
+
+    /// Stamps `path` after our own save. `mtime` comes from
+    /// `write_atomic_stamped`, so a later external write still shows as a conflict.
+    pub fn record_stamp(&mut self, path: &Path, mtime: Option<SystemTime>, bytes: &[u8]) {
+        if let Some(d) = self.conflicts.as_mut() {
+            guarded("conflict record", || d.record_stamp(path, mtime, bytes));
         }
     }
 

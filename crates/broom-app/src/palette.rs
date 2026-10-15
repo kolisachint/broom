@@ -11,12 +11,12 @@
 use std::cmp::Reverse;
 use std::path::PathBuf;
 
-use broom_config::{Chord, Command, Keymap};
+use broom_config::{Chord, Command};
 use gpui_kit::*;
 
 use crate::search::{MAX_FILES, walk_files};
 use crate::theme;
-use crate::workspace::{Workspace, guarded};
+use crate::workspace::Workspace;
 
 /// Every command, in the order of `broom_config::Command`.
 pub const ALL: &[Command] = &[
@@ -139,9 +139,7 @@ pub fn chord_label(chord: &Chord) -> String {
 /// Key label for each command, from the user's keymap (or the defaults).
 /// Only the first global binding is shown. Commands with no binding are absent.
 pub fn key_labels() -> Vec<(Command, String)> {
-    let keymap =
-        guarded("keymap", || Keymap::load(&broom_config::keymap_path())).and_then(Result::ok);
-    let Some(keymap) = keymap else {
+    let Some(keymap) = crate::keys::load_keymap() else {
         return Vec::new();
     };
     let mut out: Vec<(Command, String)> = Vec::new();
@@ -438,7 +436,7 @@ impl Render for Palette {
             .pt(px(72.))
             .bg(rgba(0x00000040))
             .track_focus(&self.focus)
-            .key_context("Palette")
+            .key_context("Palette TextInput")
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
             .child(
                 div()
