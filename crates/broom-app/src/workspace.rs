@@ -37,6 +37,10 @@ pub struct Workspace {
     pub center: Option<Entity<Editor>>,
     /// Right panel. `None` draws the empty placeholder pane.
     pub right: Option<AnyView>,
+    /// Open overlay (palette, quick open, search, cheatsheet). Drawn on top.
+    pub overlay: Option<AnyView>,
+    /// Keeps the overlay's event subscription alive.
+    pub overlay_sub: Option<Subscription>,
     /// Status bar text. Refreshed from the editor on every edit.
     pub status: SharedString,
     settings: Settings,
@@ -82,6 +86,8 @@ impl Workspace {
             left: None,
             center,
             right: None,
+            overlay: None,
+            overlay_sub: None,
             status: SharedString::default(),
             settings,
             _subs: subs,
@@ -200,6 +206,7 @@ impl Render for Workspace {
                     .child(self.center_pane())
                     .child(right),
             )
+            .children(self.overlay.clone())
             .child(
                 // Status bar: text only, no colour-only meaning.
                 div()
