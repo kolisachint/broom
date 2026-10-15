@@ -25,7 +25,8 @@ pub struct WikiTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WikiLinkSpan {
     pub link: WikiTarget,
-    /// Byte range in the searched text, covering `[[` through `]]` inclusive.
+    /// Byte range (not char indexes) in the searched text, covering `[[` through
+    /// `]]` inclusive. Slice with `&text[span]`.
     pub span: Range<usize>,
 }
 
@@ -36,12 +37,15 @@ pub fn find_wikilinks(text: &str) -> Vec<WikiLinkSpan> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 1 < bytes.len() {
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
         if let Some(region) = region_at(&excluded, i) {
             i = region.end;
             continue;
         }
-        if bytes[i] == b'['
-            && bytes[i + 1] == b'['
+        if bytes[i + 1] == b'['
             && !is_escaped(bytes, i)
             && let Some(found) = link_at(text, i)
             && !overlaps(&excluded, &found.span)
@@ -93,9 +97,21 @@ pub(crate) fn strip_md(s: &str) -> &str {
     }
 }
 
-/// Text before `|`. The whole inner text when there is no `|`.
-fn target_part(inner: &str) -> &str {
-    inner.split_once('|').map_or(inner, |(t, _)| t)
+/// Splits `inner` at its first alias separator, `|` or the table form `\|`.
+/// Returns the target text (the `\` removed) and the text after the separator.
+fn split_alias(inner: &str) -> Option<(&str, &str)> {
+    let p = inner.find('|')?;
+    let before = if inner[..p].ends_with('\\') {
+        &inner[..p - 1]
+    } else {
+        &inner[..p]
+    };
+    Some((before, &inner[p + 1..]))
+}
+
+/// Text before the alias separator. The whole inner text when there is none.
+pub(crate) fn target_part(inner: &str) -> &str {
+    split_alias(inner).map_or(inner, |(t, _)| t)
 }
 
 /// Text before `#` (and `|`).
@@ -106,7 +122,7 @@ fn target_part_hash_free(inner: &str) -> &str {
 
 /// Parses the text between `[[` and `]]`. `None` when the target is empty.
 fn parse_inner(inner: &str) -> Option<WikiTarget> {
-    let (name_part, alias) = match inner.split_once('|') {
+    let (name_part, alias) = match split_alias(inner) {
         Some((name, alias)) => {
             let alias = alias.trim();
             (name, (!alias.is_empty()).then(|| alias.to_string()))
@@ -163,7 +179,7 @@ fn overlaps(regions: &[Range<usize>], span: &Range<usize>) -> bool {
 
 /// Byte ranges of code: fenced blocks and inline code spans. Sorted, disjoint.
 fn code_regions(text: &str) -> Vec<Range<usize>> {
-    let fenced = fenced_regions(text);
+    let fenced = block_regions(text);
     let mut out = fenced.clone();
     let bytes = text.as_bytes();
     let mut f = 0;
@@ -231,40 +247,115 @@ fn run_len(bytes: &[u8], i: usize, c: u8) -> usize {
     bytes[i..].iter().take_while(|&&b| b == c).count()
 }
 
-/// Byte ranges of fenced code blocks. An unclosed block runs to the end.
-fn fenced_regions(text: &str) -> Vec<Range<usize>> {
+/// Byte ranges of block code, sorted: fenced blocks (```` ``` ```` / `~~~`)
+/// and indented code blocks (4 spaces or a tab after a blank line, outside
+/// lists). Block quote markers are stripped first, so `> ```` and `>     code`
+/// count. An unclosed fence runs to the end.
+fn block_regions(text: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     // (fence byte, fence length, start offset)
-    let mut open: Option<(u8, usize, usize)> = None;
+    let mut fence: Option<(u8, usize, usize)> = None;
+    // (start offset, end offset of the last code line)
+    let mut indented: Option<(usize, usize)> = None;
+    let mut prev_blank = true;
+    let mut in_list = false;
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
+        let start = offset;
         let end = offset + line.len();
-        let trimmed = line.trim_start();
-        match open {
-            None => {
-                if let Some((ch, len)) = fence_run(trimmed)
-                    && !(ch == b'`' && trimmed[len..].contains('`'))
-                {
-                    open = Some((ch, len, offset));
-                }
-            }
-            Some((ch, len, start)) => {
-                if let Some((c, l)) = fence_run(trimmed)
-                    && c == ch
-                    && l >= len
-                    && trimmed[l..].trim().is_empty()
-                {
-                    out.push(start..end);
-                    open = None;
-                }
-            }
-        }
         offset = end;
+        let content = strip_quote_markers(line);
+        let t = content.trim_start();
+        let blank = content.trim().is_empty();
+
+        if let Some((ch, len, open)) = fence {
+            if let Some((c, l)) = fence_run(t)
+                && c == ch
+                && l >= len
+                && t[l..].trim().is_empty()
+            {
+                out.push(open..end);
+                fence = None;
+            }
+            prev_blank = false;
+            continue;
+        }
+        if let Some((code_start, code_end)) = indented {
+            if is_indented(content) {
+                indented = Some((code_start, end));
+                continue;
+            }
+            if blank {
+                continue;
+            }
+            out.push(code_start..code_end);
+            indented = None;
+        }
+        if blank {
+            prev_blank = true;
+            continue;
+        }
+        let indented_line = is_indented(content);
+        if prev_blank && indented_line && !in_list {
+            indented = Some((start, end));
+            prev_blank = false;
+            continue;
+        }
+        if prev_blank && !indented_line && !is_list_item(content) {
+            in_list = false;
+        }
+        if is_list_item(content) {
+            in_list = true;
+        }
+        prev_blank = false;
+        if let Some((ch, len)) = fence_run(t)
+            && !(ch == b'`' && t[len..].contains('`'))
+        {
+            fence = Some((ch, len, start));
+        }
     }
-    if let Some((_, _, start)) = open {
-        out.push(start..text.len());
+    if let Some((_, _, open)) = fence {
+        out.push(open..text.len());
+    }
+    if let Some((s, e)) = indented {
+        out.push(s..e);
     }
     out
+}
+
+/// `line` without leading block quote markers (`>`, with an optional space
+/// after each). Lines indented 4 or more are left alone: they are code.
+fn strip_quote_markers(line: &str) -> &str {
+    let mut s = line;
+    loop {
+        let t = s.trim_start_matches(' ');
+        if s.len() - t.len() > 3 {
+            return s;
+        }
+        match t.strip_prefix('>') {
+            Some(rest) => s = rest.strip_prefix(' ').unwrap_or(rest),
+            None => return s,
+        }
+    }
+}
+
+/// Indented by 4 spaces or a tab.
+fn is_indented(content: &str) -> bool {
+    content.starts_with("    ") || content.starts_with('\t')
+}
+
+/// A bullet (`-`, `*`, `+`) or ordered (`1.`, `1)`) list item marker.
+fn is_list_item(content: &str) -> bool {
+    let t = content.trim_start();
+    match t.as_bytes().first() {
+        Some(b'-' | b'*' | b'+') => matches!(t.as_bytes().get(1), Some(b' ' | b'\t') | None),
+        Some(c) if c.is_ascii_digit() => {
+            let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+            matches!(t.as_bytes().get(digits), Some(b'.' | b')'))
+                && matches!(t.as_bytes().get(digits + 1), Some(b' ' | b'\t') | None)
+        }
+        _ => false,
+    }
 }
 
 /// A fence opener or closer: `(fence byte, run length)` for 3+ backticks or tildes.
@@ -480,5 +571,61 @@ mod tests {
         assert_eq!(target_key(" Ideas.MD "), "ideas");
         assert_eq!(target_key("notes\\Ideas"), "notes/ideas");
         assert_eq!(target_key("Ideas#Plan"), "ideas");
+    }
+
+    #[test]
+    fn table_escaped_pipe_is_alias_separator() {
+        assert_eq!(
+            targets(r"| [[old\|Shown]] |"),
+            vec![t("old", Some("Shown"))]
+        );
+        assert_eq!(targets(r"[[a#h\|x]]"), vec![t("a", Some("x"))]);
+        assert_eq!(heading_of(r"[[a#h\|x]]"), Some("h".to_string()));
+    }
+
+    #[test]
+    fn indented_code_after_blank_line_hides_links() {
+        let text = "para\n\n    [[a]]\n\n[[b]]";
+        assert_eq!(targets(text), vec![t("b", None)]);
+        assert_eq!(targets("\t[[a]]"), Vec::new());
+    }
+
+    #[test]
+    fn indented_line_without_blank_is_paragraph_text() {
+        assert_eq!(targets("para\n    [[a]]"), vec![t("a", None)]);
+    }
+
+    #[test]
+    fn indented_code_ends_at_unindented_line() {
+        let text = "x\n\n    [[a]]\n    [[b]]\nafter [[c]]";
+        assert_eq!(targets(text), vec![t("c", None)]);
+    }
+
+    #[test]
+    fn list_continuation_is_not_code() {
+        assert_eq!(targets("- item\n\n    [[a]]"), vec![t("a", None)]);
+        assert_eq!(targets("1. item\n\n    [[a]]"), vec![t("a", None)]);
+    }
+
+    #[test]
+    fn paragraph_after_list_restores_code() {
+        assert!(targets("- item\n\npara\n\n    [[a]]").is_empty());
+    }
+
+    #[test]
+    fn fence_inside_blockquote_hides_links() {
+        let text = "> ```\n> [[a]]\n> ```\n[[b]]";
+        assert_eq!(targets(text), vec![t("b", None)]);
+    }
+
+    #[test]
+    fn indented_code_inside_blockquote_hides_links() {
+        let text = "> para\n>\n>     [[a]]\n> [[b]]";
+        assert_eq!(targets(text), vec![t("b", None)]);
+    }
+
+    #[test]
+    fn quoted_text_links_are_still_links() {
+        assert_eq!(targets("> see [[a]]"), vec![t("a", None)]);
     }
 }
