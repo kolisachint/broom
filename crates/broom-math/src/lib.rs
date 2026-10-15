@@ -1,23 +1,34 @@
 //! broom-math: TeX → image for inline and display math.
 //!
 //! Backend: `mitex` converts TeX to Typst math syntax (pure Rust, no deps),
-//! then Typst 0.15 lays it out with the embedded New Computer Modern Math
-//! font (`typst-assets`) and `typst-render` rasterizes it. Everything is pure
-//! Rust and builds offline on macOS with no system libraries.
+//! then Typst 0.15 lays it out and `typst-render` rasterizes it. Everything is
+//! pure Rust and builds offline on macOS with no system libraries.
+//!
+//! Fonts: `typst_assets::fonts()` is all-or-nothing (its per-face constants
+//! cover only PDF fonts), so every bundled face is embedded, about 17 files.
+//! The math face is New Computer Modern Math.
 //!
 //! Image format: straight-alpha RGBA8, row-major, top row first. The ink is
 //! black on a transparent background, so the editor can draw it over any
 //! theme color. GPUI wants BGRA. The editor converts once when it builds the
 //! render image.
 //!
-//! Sizes: formulas are laid out at a 16 pt font size (the editor's default body size). `scale` is pixels per
-//! point, so `scale = 1.0` gives 16 px text. [`render_math`] uses
-//! [`DEFAULT_SCALE`] (2.0, for HiDPI screens).
+//! Sizes: formulas are laid out at a 16 pt font size (the editor's default
+//! body size). `scale` is pixels per point, so `scale = 1.0` gives 16 px text.
+//! [`render_math`] uses [`DEFAULT_SCALE`] (2.0, for HiDPI screens).
 //!
-//! Failures never panic. Unparseable TeX gives [`MathError::Parse`]; the UI
-//! shows the raw source in a styled block.
+//! Failures never panic. Unparseable TeX, formulas with no visible ink, and
+//! formulas over [`MAX_PIXELS`] all give [`MathError::Parse`]. A panic inside
+//! mitex or Typst is caught and also becomes `Parse`. The UI shows the raw
+//! source in a styled block.
+//!
+//! Security: the TeX never becomes Typst source. It reaches Typst as a string
+//! input, evaluated in math mode. `\iftypst` is the one mitex command that
+//! emits raw Typst, so it is rejected before conversion. Typst source cannot
+//! be injected. Images (`\includegraphics`) fail: no file resolver is set.
 
 use std::collections::{HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 
 use typst::foundations::{Dict, IntoValue};
@@ -84,6 +95,12 @@ pub fn render_math(tex: &str, display: bool) -> Result<MathImage, MathError> {
     render_math_scaled(tex, display, DEFAULT_SCALE)
 }
 
+/// Largest image, in pixels (width × height), that will be rendered.
+pub const MAX_PIXELS: u64 = 8_000_000;
+
+/// TeX that mitex turns into raw Typst source. Rejected before conversion.
+const RAW_TYPST_COMMAND: &str = "\\iftypst";
+
 /// Like [`render_math`], with `scale` pixels per point (16 pt text at
 /// `scale = 1.0` is 16 px tall). `scale` must be finite and positive.
 pub fn render_math_scaled(tex: &str, display: bool, scale: f32) -> Result<MathImage, MathError> {
@@ -93,7 +110,23 @@ pub fn render_math_scaled(tex: &str, display: bool, scale: f32) -> Result<MathIm
     if tex.trim().is_empty() {
         return Err(MathError::Parse("empty formula".to_string()));
     }
+    if tex.contains(RAW_TYPST_COMMAND) {
+        return Err(MathError::Parse(format!(
+            "`{RAW_TYPST_COMMAND}` is not allowed"
+        )));
+    }
+    // mitex, Typst, and typst-render can panic on odd input. Turn that into an error.
+    std::panic::catch_unwind(AssertUnwindSafe(|| render_checked(tex, display, scale)))
+        .unwrap_or_else(|_| {
+            Err(MathError::Parse(
+                "formula could not be rendered".to_string(),
+            ))
+        })
+}
 
+/// The rendering pipeline. Called only through [`render_math_scaled`], which
+/// has already validated the input and wrapped this in `catch_unwind`.
+fn render_checked(tex: &str, display: bool, scale: f32) -> Result<MathImage, MathError> {
     let math = mitex::convert_math(tex, None).map_err(MathError::Parse)?;
 
     let mut inputs = Dict::new();
@@ -113,6 +146,18 @@ pub fn render_math_scaled(tex: &str, display: bool, scale: f32) -> Result<MathIm
         .first()
         .ok_or_else(|| MathError::Backend("Typst produced no page".to_string()))?;
 
+    // Check the size before rasterizing, so huge formulas cost nothing.
+    let size = page.frame.size();
+    let px_w = size.x.to_pt() * f64::from(scale);
+    let px_h = size.y.to_pt() * f64::from(scale);
+    if px_w * px_h > MAX_PIXELS as f64 {
+        return Err(MathError::Parse(format!(
+            "formula is too large ({} × {} px)",
+            px_w.ceil(),
+            px_h.ceil()
+        )));
+    }
+
     let options = typst_render::RenderOptions {
         pixel_per_pt: typst::utils::Scalar::new(f64::from(scale)),
         ..Default::default()
@@ -123,13 +168,21 @@ pub fn render_math_scaled(tex: &str, display: bool, scale: f32) -> Result<MathIm
         return Err(MathError::Parse("formula has no visible size".to_string()));
     }
 
+    let rgba = pixmap.take_demultiplied();
+    // Empty input such as `{}` or `\label{x}` lays out to a box but draws nothing.
+    if !rgba.iter().skip(3).step_by(4).any(|&a| a > 0) {
+        return Err(MathError::Parse(
+            "formula has no visible content".to_string(),
+        ));
+    }
+
     let baseline_pt = formula_baseline_pt(&page.frame);
     let baseline = (baseline_pt * f64::from(scale)).clamp(0.0, f64::from(height)) as f32;
 
     Ok(MathImage {
         width,
         height,
-        rgba: pixmap.take_demultiplied(),
+        rgba,
         baseline,
     })
 }
@@ -175,22 +228,36 @@ fn formula_baseline_pt(frame: &typst::layout::Frame) -> f64 {
 /// Cache key: TeX source, display flag, and the bit pattern of the scale.
 type CacheKey = (String, bool, u32);
 
+/// Default byte budget for [`MathCache::new`]: 64 MB of RGBA pixels.
+pub const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Caches rendered formulas by `(tex, display, scale)`. Evicts the least
-/// recently used entry when full. Errors are not cached.
+/// recently used entries when either the entry count or the byte budget
+/// (sum of `rgba` lengths) would be exceeded. Errors are not cached, and an
+/// image larger than the whole budget is not cached.
 #[derive(Debug)]
 pub struct MathCache {
     capacity: usize,
+    max_bytes: usize,
+    bytes: usize,
     entries: HashMap<CacheKey, Arc<MathImage>>,
     /// Keys from least to most recently used.
     order: VecDeque<CacheKey>,
 }
 
 impl MathCache {
-    /// Empty cache that holds at most `capacity` formulas. A capacity of 0
-    /// renders every call and caches nothing.
+    /// Empty cache that holds at most `capacity` formulas and
+    /// [`DEFAULT_CACHE_BYTES`]. A capacity of 0 renders every call and caches nothing.
     pub fn new(capacity: usize) -> MathCache {
+        MathCache::with_budget(capacity, DEFAULT_CACHE_BYTES)
+    }
+
+    /// Like [`MathCache::new`], with an explicit byte budget.
+    pub fn with_budget(capacity: usize, max_bytes: usize) -> MathCache {
         MathCache {
             capacity,
+            max_bytes,
+            bytes: 0,
             entries: HashMap::new(),
             order: VecDeque::new(),
         }
@@ -217,17 +284,21 @@ impl MathCache {
         }
 
         let image = Arc::new(render_math_scaled(tex, display, scale)?);
-        if self.capacity == 0 {
+        let size = image.rgba.len();
+        if self.capacity == 0 || size > self.max_bytes {
             return Ok(image);
         }
-        while self.entries.len() >= self.capacity {
+        while self.entries.len() >= self.capacity || self.bytes + size > self.max_bytes {
             match self.order.pop_front() {
                 Some(oldest) => {
-                    self.entries.remove(&oldest);
+                    if let Some(old) = self.entries.remove(&oldest) {
+                        self.bytes -= old.rgba.len();
+                    }
                 }
                 None => break,
             }
         }
+        self.bytes += size;
         self.order.push_back(key.clone());
         self.entries.insert(key, Arc::clone(&image));
         Ok(image)
@@ -237,6 +308,7 @@ impl MathCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.bytes = 0;
     }
 
     /// Number of cached images.
@@ -247,6 +319,11 @@ impl MathCache {
     /// True when nothing is cached.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Total RGBA bytes held by the cache. Never more than the byte budget.
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Marks `key` as most recently used.
@@ -383,5 +460,58 @@ mod tests {
         let mut cache = MathCache::new(0);
         cache.get_or_render("x", false).expect("x");
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn empty_braces_are_an_error() {
+        assert!(matches!(render_math("{}", false), Err(MathError::Parse(_))));
+    }
+
+    #[test]
+    fn label_without_ink_is_an_error() {
+        assert!(matches!(
+            render_math(r"\label{x}", false),
+            Err(MathError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn include_graphics_is_an_error() {
+        assert!(render_math(r"\includegraphics{a}", false).is_err());
+    }
+
+    #[test]
+    fn raw_typst_command_is_rejected_before_conversion() {
+        assert!(matches!(
+            render_math(r"\iftypst x \fi", false),
+            Err(MathError::Parse(ref m)) if m.contains("iftypst")
+        ));
+    }
+
+    #[test]
+    fn oversized_formula_is_rejected_before_rasterizing() {
+        let tex = r"\quad".repeat(20_000);
+        assert!(
+            matches!(render_math(&tex, false), Err(MathError::Parse(ref m)) if m.contains("too large"))
+        );
+    }
+
+    #[test]
+    fn cache_respects_byte_budget() {
+        // Each `x` image is a few KB. A budget of one image's size keeps one entry.
+        let one = render_math("x", false).expect("x").rgba.len();
+        let mut cache = MathCache::with_budget(100, one);
+        cache.get_or_render("x", false).expect("x");
+        cache.get_or_render("y", false).expect("y");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.bytes() <= one);
+    }
+
+    #[test]
+    fn image_bigger_than_budget_is_not_cached() {
+        let mut cache = MathCache::with_budget(10, 16);
+        assert!(cache.get_or_render("x^2", false).is_ok());
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes(), 0);
     }
 }
