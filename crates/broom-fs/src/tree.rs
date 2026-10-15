@@ -4,12 +4,12 @@
 //! time it is asked for (via [`FileTree::children`] or by expanding it).
 //!
 //! Ordering: folders first, then files, each group by name (case-insensitive).
-//! `.git` is never listed. Every other file is shown.
+//! Hidden: `.git` folders, `.DS_Store` files, and `*.broom-tmp` temp files
+//! left by [`crate::write_atomic`]. Every other file is shown.
 //!
 //! Symlinks are shown as files and never followed, so a link cannot make the
 //! tree loop.
 
-use std::cmp::Ordering;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -17,7 +17,10 @@ use std::path::{Component, Path, PathBuf};
 use crate::IGNORED_DIR_NAMES;
 
 /// Files never listed, on top of [`IGNORED_DIR_NAMES`].
-const IGNORED_FILE_NAMES: &[&str] = &[".DS_Store"];
+pub(crate) const IGNORED_FILE_NAMES: &[&str] = &[".DS_Store"];
+
+/// Suffix of temp files from [`crate::write_atomic`]. Never listed.
+pub(crate) const TMP_SUFFIX: &str = ".broom-tmp";
 
 /// Kind of a file-system entry as shown in the tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,17 +64,21 @@ pub struct FileTree {
 impl FileTree {
     /// Opens a tree rooted at `root`. Lists the root only.
     /// Errors if `root` is not a readable directory.
+    ///
+    /// The root is canonicalized (symlinks resolved), so paths from the
+    /// watcher, which are canonicalized too, match the rows.
     pub fn open(root: &Path) -> io::Result<FileTree> {
-        if !fs::metadata(root)?.is_dir() {
+        let root = fs::canonicalize(root)?;
+        if !fs::metadata(&root)?.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
                 format!("{} is not a folder", root.display()),
             ));
         }
         let mut listings = std::collections::HashMap::new();
-        listings.insert(root.to_path_buf(), list_dir(root)?);
+        listings.insert(root.clone(), list_dir(&root)?);
         Ok(FileTree {
-            root: root.to_path_buf(),
+            root,
             listings,
             expanded: std::collections::HashSet::new(),
         })
@@ -240,15 +247,19 @@ fn is_gone(err: &io::Error) -> bool {
 }
 
 fn is_ignored(name: &str) -> bool {
-    IGNORED_DIR_NAMES.contains(&name) || IGNORED_FILE_NAMES.contains(&name)
+    IGNORED_DIR_NAMES.contains(&name)
+        || IGNORED_FILE_NAMES.contains(&name)
+        || name.ends_with(TMP_SUFFIX)
 }
 
 /// Folders first, then by name, case-insensitive. Exact name breaks ties.
-fn compare_entries(a: &TreeEntry, b: &TreeEntry) -> Ordering {
-    (a.kind != EntryKind::Dir)
-        .cmp(&(b.kind != EntryKind::Dir))
-        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        .then_with(|| a.name.cmp(&b.name))
+/// Lowercases each name once per listing, not once per comparison.
+fn sort_key(entry: &TreeEntry) -> (bool, String, String) {
+    (
+        entry.kind != EntryKind::Dir,
+        entry.name.to_lowercase(),
+        entry.name.clone(),
+    )
 }
 
 /// Lists one folder from disk, without ignored names, sorted for display.
@@ -272,7 +283,7 @@ fn list_dir(dir: &Path) -> io::Result<Vec<TreeEntry>> {
             kind,
         });
     }
-    entries.sort_by(compare_entries);
+    entries.sort_by_cached_key(sort_key);
     Ok(entries)
 }
 
@@ -286,7 +297,8 @@ mod tests {
 
     fn sample() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
+        // Canonical, as `open` makes it (`/var` is a symlink on macOS).
+        let root = fs::canonicalize(dir.path()).unwrap();
         fs::create_dir(root.join("beta")).unwrap();
         fs::create_dir(root.join("Alpha")).unwrap();
         fs::create_dir(root.join(".git")).unwrap();
@@ -295,10 +307,32 @@ mod tests {
         fs::write(root.join("banana.png"), "").unwrap();
         fs::write(root.join(".DS_Store"), "").unwrap();
         fs::write(root.join(".gitignore"), "").unwrap();
+        fs::write(root.join("half.md.broom-tmp"), "").unwrap();
         fs::write(root.join("beta/inner.md"), "").unwrap();
         fs::write(root.join("beta/aa.md"), "").unwrap();
         fs::create_dir(root.join("beta/sub")).unwrap();
         (dir, root)
+    }
+
+    #[test]
+    fn temp_files_from_atomic_saves_are_hidden() {
+        let (_guard, root) = sample();
+        let tree = FileTree::open(&root).unwrap();
+        let names: Vec<&str> = tree.listings[&root].iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"half.md.broom-tmp"), "{names:?}");
+        assert!(names.contains(&"zeta.md"));
+    }
+
+    #[test]
+    fn symlinked_root_is_canonicalized() {
+        let (_guard, root) = sample();
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let tree = FileTree::open(&link).unwrap();
+        assert_eq!(tree.root(), root.as_path());
+        assert!(tree.listings.contains_key(&root));
     }
 
     #[test]

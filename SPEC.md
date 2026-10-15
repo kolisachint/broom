@@ -10,10 +10,10 @@ A native macOS markdown editor. Rust. GPUI + gpui-kit.
 
 ## Files
 
-- The tree shows ALL files.
+- The tree shows all files except `.git` and `.DS_Store` (and `*.broom-tmp` temp files from atomic saves).
 - `.md` / `.markdown` open in broom.
 - Everything else opens in the default macOS app (`open`).
-- `.git` is hidden. Folders sort first, then names (case-insensitive).
+- Folders sort first, then names (case-insensitive).
 - Single click or Space = VSCode-style **preview tab**.
   - A preview tab is replaced by the next preview.
   - It becomes **pinned** on first edit or on double-click / Enter.

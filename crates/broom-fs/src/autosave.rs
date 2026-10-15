@@ -36,12 +36,19 @@ impl AutoSaver {
     }
 
     /// Removes any pending save for `path`. Call after a manual save.
+    ///
+    /// A rename does not move the entry. After renaming a file, call
+    /// [`AutoSaver::cancel`] for the old path, and check conflicts for the
+    /// new one before saving.
     pub fn cancel(&mut self, path: &Path) {
         self.pending.remove(path);
     }
 
     /// Paths whose deadline is at or before `now`. Removes them from the
     /// pending set; the caller must save them. Sorted by path.
+    ///
+    /// Removal happens before the save. If the save fails, call
+    /// [`AutoSaver::note_edit`] again so the path is retried.
     pub fn take_due(&mut self, now: Instant) -> Vec<PathBuf> {
         let delay = self.delay;
         let mut due: Vec<PathBuf> = self

@@ -245,10 +245,12 @@ fn parse_original_path(text: &str) -> Option<PathBuf> {
     let hex_value = text
         .lines()
         .find_map(|line| line.strip_prefix(META_HEX_KEY));
-    if let Some(bytes) = hex_value.and_then(unquote).and_then(hex_decode) {
-        if let Some(path) = path_from_bytes(bytes) {
-            return Some(path);
-        }
+    let hex_path = hex_value
+        .and_then(unquote)
+        .and_then(hex_decode)
+        .and_then(path_from_bytes);
+    if hex_path.is_some() {
+        return hex_path;
     }
     let value = text.lines().find_map(|line| line.strip_prefix(META_KEY))?;
     let inner = unquote(value.trim_end())?;
@@ -265,7 +267,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 || !text.is_ascii() {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
         return None;
     }
     (0..text.len())

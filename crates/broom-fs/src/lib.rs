@@ -101,6 +101,9 @@ fn collect_markdown(dir: &Path, found: &mut Vec<PathBuf>) -> io::Result<()> {
 ///
 /// A symlink at `path` is followed, so the link is kept and its target is
 /// replaced. The existing file's permissions are kept.
+///
+/// Extended attributes (including macOS quarantine and Finder tags) and ACLs
+/// are not copied to the new inode, so they are lost on save. Not handled yet.
 pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     write_atomic_stamped(path, contents.as_bytes()).map(|_| ())
 }

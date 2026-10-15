@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher as _};
 
+use crate::tree::IGNORED_FILE_NAMES;
 use crate::IGNORED_DIR_NAMES;
 
 /// Quiet time after the last raw event before a batch is sent.
@@ -125,10 +126,13 @@ fn translate(res: notify::Result<notify::Event>, out: &mut Vec<WatchEvent>) {
         return;
     }
 
+    // Canonical paths, so they match `FileTree` rows when the watched root
+    // was reached through a symlink.
     let paths: Vec<PathBuf> = event
         .paths
         .into_iter()
-        .filter(|path| !is_git_path(path))
+        .filter(|path| !is_ignored_path(path))
+        .map(canonical_event_path)
         .collect();
     if paths.is_empty() {
         return;
@@ -166,10 +170,32 @@ fn translate(res: notify::Result<notify::Event>, out: &mut Vec<WatchEvent>) {
     }
 }
 
-/// True when any component of `path` is an ignored folder such as `.git`.
-fn is_git_path(path: &Path) -> bool {
+/// True when any component of `path` is an ignored folder such as `.git`,
+/// or the file name is an ignored file such as `.DS_Store`.
+fn is_ignored_path(path: &Path) -> bool {
     path.components()
         .any(|c| IGNORED_DIR_NAMES.iter().any(|name| c.as_os_str() == *name))
+        || path.file_name().is_some_and(|name| {
+            IGNORED_FILE_NAMES
+                .iter()
+                .any(|ignored| name == *ignored)
+        })
+}
+
+/// Best effort: resolves symlinks in `path`. A removed file cannot be
+/// canonicalized, so its parent is resolved and the name re-attached.
+/// Falls back to `path` unchanged.
+fn canonical_event_path(path: PathBuf) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(&path) {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+            Ok(resolved) => resolved.join(name),
+            Err(_) => path,
+        },
+        _ => path,
+    }
 }
 
 /// Removes exact duplicates and redundant `Modified` events, keeping order.
@@ -290,9 +316,11 @@ mod tests {
     #[test]
     fn unknown_rename_direction_uses_existence() {
         let dir = tempfile::tempdir().unwrap();
-        let present = dir.path().join("present.md");
+        // Canonical, since event paths are canonicalized (`/var` is a symlink).
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let present = base.join("present.md");
         fs::write(&present, "").unwrap();
-        let missing = dir.path().join("missing.md");
+        let missing = base.join("missing.md");
         let out = run(vec![raw(
             EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
             &[present.to_str().unwrap(), missing.to_str().unwrap()],
@@ -304,6 +332,41 @@ mod tests {
                 WatchEvent::Removed(missing.clone()),
             ]
         );
+    }
+
+    #[test]
+    fn drops_ds_store_events() {
+        let out = run(vec![
+            raw(EventKind::Create(CreateKind::File), &["/r/.DS_Store"]),
+            raw(EventKind::Modify(ModifyKind::Any), &["/r/sub/.DS_Store"]),
+            raw(EventKind::Create(CreateKind::File), &["/r/a.md"]),
+        ]);
+        assert_eq!(out, vec![WatchEvent::Created(p("/r/a.md"))]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_paths_are_canonical_under_symlinked_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("a.md"), "").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Existing file reached through the link.
+        let out = run(vec![raw(
+            EventKind::Create(CreateKind::File),
+            &[link.join("a.md").to_str().unwrap()],
+        )]);
+        assert_eq!(out, vec![WatchEvent::Created(real.join("a.md"))]);
+
+        // Removed file: the parent is resolved, the name re-attached.
+        let out = run(vec![raw(
+            EventKind::Remove(RemoveKind::File),
+            &[link.join("gone.md").to_str().unwrap()],
+        )]);
+        assert_eq!(out, vec![WatchEvent::Removed(real.join("gone.md"))]);
     }
 
     #[test]
@@ -319,12 +382,13 @@ mod tests {
     #[test]
     fn rename_with_one_git_side_is_a_single_path_event() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("index");
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let target = base.join("index");
         fs::write(&target, "").unwrap();
         let out = run(vec![raw(
             EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
             &[
-                dir.path().join(".git/index.lock").to_str().unwrap(),
+                base.join(".git/index.lock").to_str().unwrap(),
                 target.to_str().unwrap(),
             ],
         )]);
@@ -434,7 +498,7 @@ mod tests {
                 WatchEvent::Rescan => vec![],
             };
             assert!(
-                paths.iter().all(|p| !is_git_path(p)),
+                paths.iter().all(|p| !is_ignored_path(p)),
                 "leaked .git event: {event:?}"
             );
         }
