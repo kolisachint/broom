@@ -19,6 +19,8 @@
 pub mod buffer;
 pub mod key;
 pub mod machine;
+#[cfg(test)]
+mod mock;
 
 pub use broom_config::Command;
 pub use buffer::{Cursor, Selection, TextRange, VimBuffer};
