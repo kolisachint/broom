@@ -22,7 +22,8 @@ use broom_core::Document;
 use gpui_kit::*;
 
 use crate::editor::{Editor, EditorEvent, EditorStyle, ViewMode};
-use crate::theme;
+use crate::keys::Run;
+use crate::{theme, zen};
 
 /// Pane widths in logical pixels.
 pub const LEFT_WIDTH: f32 = 240.0;
@@ -39,7 +40,9 @@ pub struct Workspace {
     pub right: Option<AnyView>,
     /// Status bar text. Refreshed from the editor on every edit.
     pub status: SharedString,
-    settings: Settings,
+    /// Zen mode: panels and status bar hidden, centre column narrowed.
+    pub zen: bool,
+    pub(crate) settings: Settings,
     _subs: Vec<Subscription>,
 }
 
@@ -83,6 +86,7 @@ impl Workspace {
             center,
             right: None,
             status: SharedString::default(),
+            zen: false,
             settings,
             _subs: subs,
         };
@@ -160,13 +164,14 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .p_6()
-            .child(body)
+            .child(zen::column(self.zen, body))
     }
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let left = match &self.left {
+            _ if self.zen => div().into_any_element(),
             Some(view) => div()
                 .w(px(LEFT_WIDTH))
                 .h_full()
@@ -175,6 +180,7 @@ impl Render for Workspace {
             None => Self::pane(&self.folder.display().to_string(), LEFT_WIDTH).into_any_element(),
         };
         let right = match &self.right {
+            _ if self.zen => div().into_any_element(),
             Some(view) => div()
                 .w(px(RIGHT_WIDTH))
                 .h_full()
@@ -190,6 +196,9 @@ impl Render for Workspace {
             .bg(theme::color(theme::BG))
             .text_color(theme::color(theme::INK))
             .text_size(px(self.settings.font_size))
+            .on_action(cx.listener(|this, run: &Run, window, cx| {
+                this.dispatch(run.0, window, cx);
+            }))
             .child(
                 div()
                     .flex()
@@ -200,7 +209,7 @@ impl Render for Workspace {
                     .child(self.center_pane())
                     .child(right),
             )
-            .child(
+            .children((!self.zen).then(|| {
                 // Status bar: text only, no colour-only meaning.
                 div()
                     .flex()
@@ -209,8 +218,8 @@ impl Render for Workspace {
                     .py_1()
                     .bg(theme::color(theme::PANEL))
                     .text_color(theme::color(theme::MUTED))
-                    .child(self.status.clone()),
-            )
+                    .child(self.status.clone())
+            }))
     }
 }
 

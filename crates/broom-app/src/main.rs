@@ -10,8 +10,10 @@
 #![allow(dead_code)]
 
 mod editor;
+mod keys;
 mod theme;
 mod workspace;
+mod zen;
 
 use std::path::PathBuf;
 
@@ -41,6 +43,7 @@ fn main() {
         .run(move |cx| {
             // Must run before any GPUI Component feature is used.
             gpui_kit::init(cx);
+            keys::bind_keys(cx);
 
             // Fits a 1280x800 logical screen with the title bar and menu bar.
             let bounds = Bounds::centered(None, size(px(1120.), px(720.)), cx);
@@ -53,8 +56,10 @@ fn main() {
                 ..Default::default()
             };
 
-            gpui_kit::open_window(options, cx, move |_, cx| {
-                cx.new(|cx| Workspace::new(folder, cx))
+            gpui_kit::open_window(options, cx, move |window, cx| {
+                let ws = cx.new(|cx| Workspace::new(folder, cx));
+                keys::focus_editor(&ws, window, cx);
+                ws
             })
             .expect("failed to open the broom window");
 

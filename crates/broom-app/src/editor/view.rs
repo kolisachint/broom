@@ -48,9 +48,15 @@ impl SegHit {
     }
 }
 
+use crate::keys::Run;
+
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match self.mode {
+        let focus = self
+            .focus_handle
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        let body = match self.mode {
             ViewMode::Source => {
                 self.ensure_source(window, cx);
                 match self.source.clone() {
@@ -62,7 +68,43 @@ impl Render for Editor {
                 }
             }
             ViewMode::Formatted => self.render_formatted(cx).into_any_element(),
-        }
+        };
+        // Text input: registered every paint so IME sees the caret's element.
+        let entity = cx.entity();
+        let input_focus = focus.clone();
+        let ime = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                let handler = ElementInputHandler::new(bounds, entity.clone());
+                window.handle_input(&input_focus, handler, cx);
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        let click_focus = focus.clone();
+        div()
+            .key_context("Editor")
+            .track_focus(&focus)
+            .size_full()
+            .relative()
+            .child(body)
+            .child(ime)
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_, window, cx| window.focus(&click_focus, cx),
+            )
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if this.handle_key_down(&ev.keystroke, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|this, run: &Run, _window, cx| {
+                if this.command(run.0, cx) {
+                    cx.stop_propagation();
+                }
+            }))
     }
 }
 

@@ -5,6 +5,7 @@
 //! is a gpui-kit code editor kept in sync with the document. Keyboard routing
 //! lives in the app root: it calls the methods here.
 
+pub mod input;
 pub mod rows;
 pub mod view;
 pub mod vim;
@@ -79,6 +80,8 @@ pub struct WikiQuery {
 
 pub struct Editor {
     pub doc: Document,
+    /// Created on first render or focus, since it needs a `Context`.
+    pub focus_handle: Option<FocusHandle>,
     pub cursor: DocPos,
     /// Selection anchor. The selection runs from here to `cursor`.
     pub anchor: Option<DocPos>,
@@ -108,6 +111,7 @@ impl Editor {
     pub fn new(doc: Document, style: EditorStyle, large: bool, bindings: &VimBindings) -> Editor {
         Editor {
             doc,
+            focus_handle: None,
             cursor: DocPos::default(),
             anchor: None,
             pref_x: None,
