@@ -18,8 +18,6 @@
 //! Line view: [`Document::line_count`], [`Document::line_text`], and the
 //! position mapping functions give a line/col view for vim and the UI.
 
-#![allow(unused_variables, dead_code)] // scaffold: remove as stubs are implemented
-
 pub mod block;
 pub mod document;
 pub mod edit;
@@ -27,7 +25,10 @@ pub mod inline;
 pub mod input_rules;
 pub mod pos;
 
+mod ops;
 mod parse;
+mod runs;
+mod slots;
 mod serialize;
 mod undo;
 
