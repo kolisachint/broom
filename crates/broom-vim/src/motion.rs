@@ -233,7 +233,7 @@ fn end_of_buffer(buf: &dyn VimBuffer) -> Cursor {
     }
 }
 
-fn first_nonblank(buf: &dyn VimBuffer, line: usize) -> usize {
+pub(crate) fn first_nonblank(buf: &dyn VimBuffer, line: usize) -> usize {
     let text = buf.line(line).unwrap_or_default();
     text.chars().position(|c| !c.is_whitespace()).unwrap_or(0)
 }
