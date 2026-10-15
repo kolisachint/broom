@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn locate_maps_visible_offsets() {
         let lens = [3, 0, 2];
-        assert_eq!(visible_len(&lens), 3 + 1 + 0 + 1 + 2);
+        assert_eq!(visible_len(&lens), 7);
         assert_eq!(locate(&lens, 0), Some((0, 0)));
         assert_eq!(locate(&lens, 3), Some((0, 3)));
         assert_eq!(locate(&lens, 4), Some((1, 0)));

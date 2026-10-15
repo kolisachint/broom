@@ -96,17 +96,17 @@ pub(crate) fn insert_typed(
     text: &str,
 ) -> Result<InputRuleOutcome, EditError> {
     doc.validate_insert(pos, text)?;
-    if text == "\n" {
-        if let Some((lang, body)) = fence_at(&doc.blocks[pos.block].kind, pos.offset) {
-            doc.checkpoint(pos, false);
-            doc.blocks[pos.block].kind = BlockKind::CodeBlock { lang, text: body };
-            doc.sync(pos.block);
-            return Ok(InputRuleOutcome::BlockChanged {
-                block: pos.block,
-                kind: BlockType::CodeBlock,
-                cursor: DocPos::new(pos.block, 0),
-            });
-        }
+    if text == "\n"
+        && let Some((lang, body)) = fence_at(&doc.blocks[pos.block].kind, pos.offset)
+    {
+        doc.checkpoint(pos, false);
+        doc.blocks[pos.block].kind = BlockKind::CodeBlock { lang, text: body };
+        doc.sync(pos.block);
+        return Ok(InputRuleOutcome::BlockChanged {
+            block: pos.block,
+            kind: BlockType::CodeBlock,
+            cursor: DocPos::new(pos.block, 0),
+        });
     }
     if text.is_empty() || text.contains('\n') {
         let cursor = doc.insert_text(pos, text)?;
@@ -183,10 +183,11 @@ fn block_rule(kind: &BlockKind, c: usize) -> Option<BlockRule> {
     match kind {
         BlockKind::Paragraph { .. } => {
             let prefix: String = kind.visible_text().chars().take(c).collect();
-            if let Some(hashes) = prefix.strip_suffix(' ') {
-                if (1..=6).contains(&hashes.len()) && hashes.bytes().all(|b| b == b'#') {
-                    return Some(BlockRule::Heading(hashes.len() as u8));
-                }
+            if let Some(hashes) = prefix.strip_suffix(' ')
+                && (1..=6).contains(&hashes.len())
+                && hashes.bytes().all(|b| b == b'#')
+            {
+                return Some(BlockRule::Heading(hashes.len() as u8));
             }
             match prefix.as_str() {
                 "- " | "* " => Some(BlockRule::Bullet),

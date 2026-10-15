@@ -201,8 +201,7 @@ impl Document {
                 self.blocks[b].kind = kind;
             }
         } else {
-            for k in k1..=k2 {
-                let n = lens[k];
+            for (k, &n) in lens.iter().enumerate().take(k2 + 1).skip(k1) {
                 let (a, e) = if k == k1 {
                     (l1, n)
                 } else if k == k2 {
@@ -263,9 +262,12 @@ impl Document {
             EditError::Unsupported("the joined text cannot be shown in this block".into())
         })?;
         self.checkpoint(DocPos::new(a, from), false);
+        // The joined block is followed by what followed the last block.
+        let after = trailing_of(&self.blocks[b].source).to_string();
         self.blocks.drain(a + 1..=b);
+        self.blocks[a].source = format!("{}{}", reserialize("", &new_kind), after);
         self.blocks[a].kind = new_kind;
-        self.sync(a);
+        self.blocks[a].edited = true;
         Ok(())
     }
 

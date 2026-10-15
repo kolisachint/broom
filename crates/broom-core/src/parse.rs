@@ -356,11 +356,7 @@ impl<'e, 'a> Builder<'e, 'a> {
         let mut runs: Vec<Run> = Vec::new();
         let mut style = Style::default();
         let mut stack: Vec<Style> = Vec::new();
-        loop {
-            let ev = match self.peek() {
-                Some(ev) => ev,
-                None => break,
-            };
+        while let Some(ev) = self.peek() {
             match ev {
                 Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link) => {
                     style = stack.pop()?;
@@ -430,11 +426,11 @@ pub(crate) fn push_run(runs: &mut Vec<Run>, text: &str, style: &Style) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = runs.last_mut() {
-        if last.style == *style {
-            last.text.push_str(text);
-            return;
-        }
+    if let Some(last) = runs.last_mut()
+        && last.style == *style
+    {
+        last.text.push_str(text);
+        return;
     }
     runs.push(Run {
         text: text.to_string(),

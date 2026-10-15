@@ -179,11 +179,11 @@ pub(crate) fn normalize(runs: &mut Vec<Run>) {
     }
     let mut out: Vec<Run> = Vec::with_capacity(runs.len());
     for r in runs.drain(..) {
-        if let Some(last) = out.last_mut() {
-            if last.style == r.style {
-                last.text.push_str(&r.text);
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && last.style == r.style
+        {
+            last.text.push_str(&r.text);
+            continue;
         }
         out.push(r);
     }

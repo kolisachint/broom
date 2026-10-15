@@ -270,10 +270,10 @@ impl Document {
     /// Opaque and front matter blocks return [`EditError::Locked`] or `Unsupported`.
     pub fn set_block_kind(&mut self, block: usize, kind: BlockType) -> Result<(), EditError> {
         self.check_pos(DocPos::new(block, 0))?;
-        if let BlockType::Heading(level) = kind {
-            if !(1..=6).contains(&level) {
-                return Err(EditError::Unsupported("heading level must be 1 to 6".into()));
-            }
+        if let BlockType::Heading(level) = kind
+            && !(1..=6).contains(&level)
+        {
+            return Err(EditError::Unsupported("heading level must be 1 to 6".into()));
         }
         let new_kind = slots::convert(&self.blocks[block].kind, kind)?;
         self.checkpoint(DocPos::new(block, 0), false);
@@ -433,5 +433,372 @@ mod tests {
         let doc = Document::parse("# Title **x**\n\n- a\n- [ ] b\n");
         assert_eq!(doc.visible_text(0).as_deref(), Some("Title x"));
         assert_eq!(doc.visible_text(1).as_deref(), Some("a\nb"));
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use crate::block::{BlockKind, BlockType};
+    use crate::edit::{EditError, StyleFlag};
+    use crate::pos::DocRange;
+
+    const DOC: &str = "# Title\n\nFirst paragraph.\n\n- a\n- b\n\n```\ncode\n```\n\nLast para\n";
+
+    fn at(block: usize, offset: usize) -> DocPos {
+        DocPos::new(block, offset)
+    }
+
+    #[test]
+    fn editing_one_block_keeps_others_byte_identical() {
+        let mut doc = Document::parse(DOC);
+        let before: Vec<String> = doc.blocks().iter().map(|b| b.source().to_string()).collect();
+        doc.insert_text(at(1, 0), "Very ").unwrap();
+        for (i, src) in before.iter().enumerate() {
+            if i == 1 {
+                assert_eq!(doc.block(i).unwrap().source(), "Very First paragraph.\n\n");
+                assert!(doc.block(i).unwrap().is_edited());
+            } else {
+                assert_eq!(doc.block(i).unwrap().source(), src, "block {i}");
+                assert!(!doc.block(i).unwrap().is_edited());
+            }
+        }
+        assert_eq!(doc.to_markdown(), DOC.replacen("First", "Very First", 1));
+        assert!(doc.is_dirty());
+    }
+
+    #[test]
+    fn insert_text_with_newline_splits_paragraph() {
+        let mut doc = Document::parse("one two\n");
+        let cur = doc.insert_text(at(0, 3), "\nX").unwrap();
+        assert_eq!(cur, at(1, 1));
+        assert_eq!(doc.block_count(), 2);
+        assert_eq!(doc.visible_text(0).unwrap(), "one");
+        assert_eq!(doc.visible_text(1).unwrap(), "X two");
+    }
+
+    #[test]
+    fn undo_and_redo_restore_states() {
+        let mut doc = Document::parse("start\n");
+        doc.break_undo_group();
+        doc.insert_text(at(0, 5), "!").unwrap();
+        doc.break_undo_group();
+        doc.insert_text(at(0, 6), "?").unwrap();
+        assert_eq!(doc.to_markdown(), "start!?\n");
+        assert_eq!(doc.undo(), Some(at(0, 6)));
+        assert_eq!(doc.to_markdown(), "start!\n");
+        assert_eq!(doc.undo(), Some(at(0, 5)));
+        assert_eq!(doc.to_markdown(), "start\n");
+        assert_eq!(doc.undo(), None);
+        assert_eq!(doc.redo(), Some(at(0, 5)));
+        assert_eq!(doc.to_markdown(), "start!\n");
+        doc.redo();
+        assert_eq!(doc.to_markdown(), "start!?\n");
+        assert!(doc.redo().is_none());
+    }
+
+    #[test]
+    fn typing_coalesces_into_one_undo_step() {
+        let mut doc = Document::empty();
+        for (i, ch) in "hello".chars().enumerate() {
+            doc.insert_typed(at(0, i), &ch.to_string()).unwrap();
+        }
+        assert_eq!(doc.to_markdown(), "hello");
+        doc.undo();
+        assert_eq!(doc.to_markdown(), "");
+        assert!(doc.undo().is_none());
+    }
+
+    #[test]
+    fn new_edit_clears_redo() {
+        let mut doc = Document::parse("a\n");
+        doc.insert_text(at(0, 1), "b").unwrap();
+        doc.undo();
+        doc.insert_text(at(0, 1), "c").unwrap();
+        assert!(doc.redo().is_none());
+        assert_eq!(doc.to_markdown(), "ac\n");
+    }
+
+    #[test]
+    fn mark_saved_clears_dirty() {
+        let mut doc = Document::parse("a\n");
+        doc.insert_text(at(0, 1), "b").unwrap();
+        assert!(doc.is_dirty());
+        doc.mark_saved();
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn line_view_maps_positions() {
+        let doc = Document::parse("ab\n\n- x\n- yz\n");
+        // visible lines: "ab" (block 0) | "x" | "yz" (block 1)
+        assert_eq!(doc.line_count(), 3);
+        assert_eq!(doc.line_text(2).as_deref(), Some("yz"));
+        assert_eq!(doc.line_text(3), None);
+        assert_eq!(doc.line_to_pos(2, 1), Some(at(1, 3)));
+        assert_eq!(doc.line_to_pos(0, 99), Some(at(0, 2)), "col clamps");
+        assert_eq!(doc.pos_to_line(at(1, 3)), Some((2, 1)));
+        assert_eq!(doc.pos_to_line(at(9, 0)), None);
+        for line in 0..doc.line_count() {
+            let pos = doc.line_to_pos(line, 0).unwrap();
+            assert_eq!(doc.pos_to_line(pos), Some((line, 0)));
+        }
+    }
+
+    #[test]
+    fn line_view_with_soft_breaks() {
+        let doc = Document::parse("one\ntwo\n");
+        assert_eq!(doc.line_count(), 2);
+        assert_eq!(doc.line_text(1).as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn toggle_style_across_blocks() {
+        let mut doc = Document::parse("alpha\n\nbeta gamma\n");
+        let range = DocRange::new(at(0, 2), at(1, 4));
+        doc.toggle_style(range, StyleFlag::Bold).unwrap();
+        assert_eq!(doc.to_markdown(), "al**pha**\n\n**beta** gamma\n");
+        doc.toggle_style(range, StyleFlag::Bold).unwrap();
+        assert_eq!(doc.to_markdown(), "alpha\n\nbeta gamma\n");
+    }
+
+    #[test]
+    fn toggle_style_only_adds_when_not_all_styled() {
+        let mut doc = Document::parse("**ab** cd\n");
+        doc.toggle_style(DocRange::new(at(0, 0), at(0, 5)), StyleFlag::Bold).unwrap();
+        assert_eq!(doc.to_markdown(), "**ab cd**\n");
+    }
+
+    #[test]
+    fn toggle_style_leaves_code_blocks_alone() {
+        let mut doc = Document::parse("```\ncode\n```\n");
+        doc.toggle_style(DocRange::new(at(0, 0), at(0, 4)), StyleFlag::Bold).unwrap();
+        assert_eq!(doc.to_markdown(), "```\ncode\n```\n");
+    }
+
+    #[test]
+    fn set_link_and_remove() {
+        let mut doc = Document::parse("see here\n");
+        doc.set_link(DocRange::new(at(0, 4), at(0, 8)), Some("https://x")).unwrap();
+        assert_eq!(doc.to_markdown(), "see [here](https://x)\n");
+        doc.set_link(DocRange::new(at(0, 4), at(0, 8)), None).unwrap();
+        assert_eq!(doc.to_markdown(), "see here\n");
+    }
+
+    #[test]
+    fn delete_within_block_and_text_in_range() {
+        let mut doc = Document::parse("hello world\n");
+        let range = DocRange::new(at(0, 5), at(0, 11));
+        assert_eq!(doc.text_in_range(range).unwrap(), " world");
+        assert_eq!(doc.delete_range(range).unwrap(), at(0, 5));
+        assert_eq!(doc.to_markdown(), "hello\n");
+    }
+
+    #[test]
+    fn delete_across_blocks_merges() {
+        let mut doc = Document::parse("alpha\n\nbeta\n");
+        let cur = doc.delete_range(DocRange::new(at(0, 2), at(1, 2))).unwrap();
+        assert_eq!(cur, at(0, 2));
+        assert_eq!(doc.block_count(), 1);
+        assert_eq!(doc.visible_text(0).unwrap(), "alta");
+        assert_eq!(doc.to_markdown(), "alta\n");
+    }
+
+    #[test]
+    fn delete_across_list_items_joins_them() {
+        let mut doc = Document::parse("- one\n- two\n- three\n");
+        doc.delete_range(DocRange::new(at(0, 1), at(0, 6))).unwrap();
+        // "one\ntwo\nthree" minus "ne\ntw": head "o" joins tail "o".
+        assert_eq!(doc.visible_text(0).unwrap(), "oo\nthree");
+        assert_eq!(doc.to_markdown(), "- oo\n- three\n");
+    }
+
+    #[test]
+    fn merge_blocks_joins_paragraphs() {
+        let mut doc = Document::parse("one\n\ntwo\n\nthree\n");
+        let cur = doc.merge_blocks(0).unwrap();
+        assert_eq!(cur, at(0, 3));
+        assert_eq!(doc.block_count(), 2);
+        assert_eq!(doc.to_markdown(), "onetwo\n\nthree\n");
+        assert!(doc.merge_blocks(1).is_err());
+    }
+
+    #[test]
+    fn split_paragraph_then_merge_back() {
+        let mut doc = Document::parse("onetwo\n");
+        let cur = doc.split_block(at(0, 3)).unwrap();
+        assert_eq!(cur, at(1, 0));
+        assert_eq!(doc.to_markdown(), "one\n\ntwo\n");
+        let back = doc.merge_blocks(0).unwrap();
+        assert_eq!(back, at(0, 3));
+        assert_eq!(doc.to_markdown(), "onetwo\n");
+    }
+
+    #[test]
+    fn split_list_item_starts_new_item() {
+        let mut doc = Document::parse("- ab\n- cd\n");
+        let cur = doc.split_block(at(0, 1)).unwrap();
+        assert_eq!(cur, at(0, 2));
+        assert_eq!(doc.visible_text(0).unwrap(), "a\nb\ncd");
+        assert_eq!(doc.to_markdown(), "- a\n- b\n- cd\n");
+    }
+
+    #[test]
+    fn split_code_block_inserts_newline() {
+        let mut doc = Document::parse("```\nab\n```\n");
+        let cur = doc.split_block(at(0, 1)).unwrap();
+        assert_eq!(cur, at(0, 2));
+        assert!(matches!(doc.block(0).unwrap().kind(), BlockKind::CodeBlock { text, .. } if text == "a\nb"));
+    }
+
+    #[test]
+    fn set_block_kind_keeps_text() {
+        let mut doc = Document::parse("plain text\n");
+        doc.set_block_kind(0, BlockType::Heading(2)).unwrap();
+        assert_eq!(doc.to_markdown(), "## plain text\n");
+        doc.set_block_kind(0, BlockType::TaskList).unwrap();
+        assert_eq!(doc.to_markdown(), "- [ ] plain text\n");
+        doc.set_block_kind(0, BlockType::Paragraph).unwrap();
+        assert_eq!(doc.to_markdown(), "plain text\n");
+        assert!(doc.set_block_kind(0, BlockType::Heading(9)).is_err());
+    }
+
+    #[test]
+    fn opaque_blocks_are_locked() {
+        let mut doc = Document::parse("para\n\n<div>raw</div>\n");
+        assert_eq!(doc.insert_text(at(1, 0), "x"), Err(EditError::Locked(1)));
+        assert_eq!(doc.delete_range(DocRange::new(at(0, 0), at(1, 1))), Err(EditError::Locked(1)));
+        assert_eq!(doc.visible_text(1).as_deref(), Some("<div>raw</div>\n"));
+        doc.replace_opaque_source(1, "<span>new</span>").unwrap();
+        assert_eq!(doc.to_markdown(), "para\n\n<span>new</span>\n");
+        assert!(doc.replace_opaque_source(0, "x").is_err());
+    }
+
+    #[test]
+    fn invalid_positions_change_nothing() {
+        let mut doc = Document::parse("abc\n");
+        assert!(matches!(doc.insert_text(at(0, 9), "x"), Err(EditError::OutOfRange(_))));
+        assert!(matches!(doc.insert_text(at(5, 0), "x"), Err(EditError::OutOfRange(_))));
+        assert!(matches!(
+            doc.delete_range(DocRange::new(at(0, 2), at(0, 1))),
+            Err(EditError::InvalidRange(_))
+        ));
+        assert!(!doc.is_dirty());
+        assert!(doc.undo().is_none());
+        assert_eq!(doc.to_markdown(), "abc\n");
+    }
+
+    #[test]
+    fn table_cell_edit_and_serialization() {
+        let mut doc = Document::parse("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        doc.insert_text(at(0, 2), "X").unwrap();
+        assert_eq!(doc.visible_text(0).unwrap(), "a\tXb\n1\t2");
+        assert!(doc.insert_text(at(0, 0), "\n").is_err());
+        assert_eq!(doc.to_markdown(), "| a | Xb |\n| --- | --- |\n| 1 | 2 |\n");
+    }
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::edit::StyleFlag;
+    use crate::pos::DocRange;
+
+    /// Tiny deterministic generator, so failures reproduce.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n.max(1)
+        }
+    }
+
+    fn random_pos(doc: &Document, rng: &mut Lcg) -> DocPos {
+        let block = rng.next(doc.block_count());
+        let len = doc.visible_len(block).unwrap_or(0);
+        DocPos::new(block, rng.next(len + 1))
+    }
+
+    #[test]
+    fn random_edits_never_panic_and_keep_invariants() {
+        const CHARS: &[&str] = &["a", "b", " ", "*", "_", "`", "~", "[", "]", "#", "-", ">", "1.", "\n", "|", "$", "\\", "é"];
+        let seeds = [
+            "# Title\n\nPara with **bold** and [[Note|x]].\n\n- a\n- [ ] b\n  - c\n\n> q\n> r\n\n```\ncode\n```\n\n| h | i |\n|---|:-:|\n| 1 | 2 |\n\n---\n\n$$\nx\n$$\n\n<div>raw</div>\n",
+            "plain\n",
+        ];
+        for (si, seed) in seeds.iter().enumerate() {
+            for run in 0..40u64 {
+                let mut rng = Lcg(run * 7919 + si as u64 + 1);
+                let mut doc = Document::parse(seed);
+                for _ in 0..150 {
+                    match rng.next(12) {
+                        0..=3 => {
+                            let pos = random_pos(&doc, &mut rng);
+                            let text = CHARS[rng.next(CHARS.len())];
+                            let _ = doc.insert_typed(pos, text);
+                        }
+                        4 => {
+                            let pos = random_pos(&doc, &mut rng);
+                            let _ = doc.insert_text(pos, "x\ny");
+                        }
+                        5 => {
+                            let a = random_pos(&doc, &mut rng);
+                            let b = random_pos(&doc, &mut rng);
+                            let _ = doc.delete_range(DocRange::new(a, b));
+                        }
+                        6 => {
+                            let pos = random_pos(&doc, &mut rng);
+                            let _ = doc.split_block(pos);
+                        }
+                        7 => {
+                            let b = rng.next(doc.block_count());
+                            let _ = doc.merge_blocks(b);
+                        }
+                        8 => {
+                            let a = random_pos(&doc, &mut rng);
+                            let b = random_pos(&doc, &mut rng);
+                            let flag = [StyleFlag::Bold, StyleFlag::Italic, StyleFlag::Strike, StyleFlag::Code][rng.next(4)];
+                            let _ = doc.toggle_style(DocRange::new(a, b).normalized(), flag);
+                        }
+                        9 => {
+                            let b = rng.next(doc.block_count());
+                            let kinds = [
+                                BlockType::Paragraph,
+                                BlockType::Heading(2),
+                                BlockType::BulletList,
+                                BlockType::OrderedList,
+                                BlockType::TaskList,
+                                BlockType::BlockQuote,
+                                BlockType::CodeBlock,
+                            ];
+                            let _ = doc.set_block_kind(b, kinds[rng.next(kinds.len())]);
+                        }
+                        10 => {
+                            let _ = doc.undo();
+                        }
+                        _ => {
+                            let _ = doc.redo();
+                        }
+                    }
+                    check_invariants(&doc);
+                }
+                // Re-parsing whatever we serialized must not panic either.
+                let _ = Document::parse(&doc.to_markdown());
+            }
+        }
+    }
+
+    fn check_invariants(doc: &Document) {
+        let joined: String = doc.blocks().iter().map(|b| b.source()).collect();
+        assert_eq!(doc.to_markdown(), joined);
+        for (i, b) in doc.blocks().iter().enumerate() {
+            if let Some(len) = doc.visible_len(i) {
+                // Every offset up to the end must map to a line and back.
+                let pos = DocPos::new(i, len);
+                assert!(doc.pos_to_line(pos).is_some(), "block {i} end");
+            }
+            let _ = b;
+        }
+        assert!(doc.line_count() >= 1);
     }
 }
