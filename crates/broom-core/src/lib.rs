@@ -28,6 +28,7 @@ pub mod input_rules;
 pub mod pos;
 
 mod parse;
+mod runs;
 mod serialize;
 mod undo;
 
