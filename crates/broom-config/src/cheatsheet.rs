@@ -260,10 +260,21 @@ mod tests {
         let rows = rows();
         let unbound = rows
             .iter()
-            .find(|r| r.command == Command::ToggleRightPanel)
-            .expect("ToggleRightPanel listed");
+            .find(|r| r.command == Command::Forward)
+            .expect("Forward listed");
         assert_eq!(unbound.section, SECTION_UNBOUND);
         assert_eq!(unbound.keys, "No shortcut");
+    }
+
+    #[test]
+    fn right_panel_chord_is_listed() {
+        let rows = rows();
+        let row = rows
+            .iter()
+            .find(|r| r.command == Command::ToggleRightPanel)
+            .expect("ToggleRightPanel listed");
+        assert_eq!(row.section, "Everywhere");
+        assert_eq!(row.keys, "Cmd+Alt+B");
     }
 
     #[test]

@@ -369,6 +369,7 @@ impl Keymap {
         bind(&mut b, Global, "cmd+0", ZoomReset);
         bind(&mut b, Global, "cmd+s", Save);
         bind(&mut b, Global, "cmd+w", CloseTab);
+        bind(&mut b, Global, "cmd+alt+b", ToggleRightPanel);
         bind(&mut b, Global, "cmd+n", NewUntitled);
         bind(&mut b, Global, "cmd+k z", ZenMode);
         bind(&mut b, Global, "ctrl+?", Cheatsheet);
