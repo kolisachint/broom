@@ -11,6 +11,8 @@
 
 mod cheatsheet;
 mod dialogs;
+#[cfg(test)]
+mod e2e;
 mod editor;
 mod keys;
 mod palette;
