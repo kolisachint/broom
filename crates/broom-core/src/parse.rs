@@ -22,39 +22,30 @@ pub(crate) fn parse_blocks(src: &str) -> Vec<Block> {
         }
         None => 0,
     };
-    let rest = &src[base..];
-    let groups = top_level_groups(rest, base);
+    let groups = top_level_groups(&src[base..], base);
 
-    for (i, (start, evs)) in groups.iter().enumerate() {
-        let next = groups.get(i + 1).map_or(src.len(), |g| g.0);
-        let kind = math_block(&src[*start..next], evs)
+    // Text that produces no events (link reference definitions) is locked.
+    let mut cursor = base;
+    for (start, end, evs) in &groups {
+        push_gap(src, cursor, *start, &mut parts);
+        let kind = math_block(&src[*start..*end], evs)
             .or_else(|| Builder::new(evs).block_all())
             .unwrap_or_else(|| BlockKind::Opaque {
                 kind: opaque_kind(evs),
             });
         parts.push((*start, kind));
+        cursor = *end;
     }
+    push_gap(src, cursor, src.len(), &mut parts);
 
-    if parts.is_empty() {
-        if base == 0 {
-            let kind = if rest.trim().is_empty() {
-                BlockKind::Paragraph { content: Vec::new() }
-            } else {
-                BlockKind::Opaque {
-                    kind: OpaqueKind::Unknown,
-                }
-            };
-            parts.push((0, kind));
-        } else if !rest.trim().is_empty() {
-            parts.push((
-                base,
-                BlockKind::Opaque {
-                    kind: OpaqueKind::Unknown,
-                },
-            ));
-        }
+    if parts.is_empty() && base == 0 {
+        parts.push((
+            0,
+            BlockKind::Paragraph {
+                content: Vec::new(),
+            },
+        ));
     }
-
     if let Some(first) = parts.first_mut() {
         first.0 = 0;
     }
@@ -68,6 +59,18 @@ pub(crate) fn parse_blocks(src: &str) -> Vec<Block> {
         });
     }
     blocks
+}
+
+/// A non-blank gap between blocks becomes a locked opaque block.
+fn push_gap(src: &str, from: usize, to: usize, parts: &mut Vec<(usize, BlockKind)>) {
+    if to > from && !src[from..to].trim().is_empty() {
+        parts.push((
+            from,
+            BlockKind::Opaque {
+                kind: OpaqueKind::Unknown,
+            },
+        ));
+    }
 }
 
 fn options() -> Options {
@@ -97,13 +100,14 @@ fn front_matter(src: &str) -> Option<(usize, String)> {
     None
 }
 
-/// Groups the events of a text into top-level blocks, with absolute start offsets.
-fn top_level_groups(text: &str, base: usize) -> Vec<(usize, Vec<Event<'_>>)> {
-    let mut groups: Vec<(usize, Vec<Event>)> = Vec::new();
+/// Groups the events of a text into top-level blocks: (start, end, events),
+/// with absolute offsets.
+fn top_level_groups(text: &str, base: usize) -> Vec<(usize, usize, Vec<Event<'_>>)> {
+    let mut groups: Vec<(usize, usize, Vec<Event>)> = Vec::new();
     let mut depth = 0usize;
     for (ev, range) in Parser::new_ext(text, options()).into_offset_iter() {
         if depth == 0 && !matches!(ev, Event::End(_)) {
-            groups.push((range.start + base, Vec::new()));
+            groups.push((range.start + base, range.end + base, Vec::new()));
         }
         match ev {
             Event::Start(_) => depth += 1,
@@ -111,7 +115,8 @@ fn top_level_groups(text: &str, base: usize) -> Vec<(usize, Vec<Event<'_>>)> {
             _ => {}
         }
         if let Some(group) = groups.last_mut() {
-            group.1.push(ev);
+            group.1 = range.end + base;
+            group.2.push(ev);
         }
     }
     groups

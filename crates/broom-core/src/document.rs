@@ -468,6 +468,15 @@ mod edit_tests {
     }
 
     #[test]
+    fn link_reference_definitions_survive_edits_above() {
+        let mut doc = Document::parse("Text.\n\n[foo]: /url\n\nUse [foo].\n");
+        doc.insert_text(at(0, 0), "X").unwrap();
+        assert_eq!(doc.to_markdown(), "XText.\n\n[foo]: /url\n\nUse [foo].\n");
+        assert!(matches!(doc.block(1).unwrap().kind(), BlockKind::Opaque { .. }));
+        assert_eq!(Document::parse(&doc.to_markdown()).to_markdown(), doc.to_markdown());
+    }
+
+    #[test]
     fn insert_text_with_newline_splits_paragraph() {
         let mut doc = Document::parse("one two\n");
         let cur = doc.insert_text(at(0, 3), "\nX").unwrap();
