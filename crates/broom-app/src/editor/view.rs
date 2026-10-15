@@ -50,6 +50,7 @@ impl SegHit {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.math.scale = window.scale_factor();
         match self.mode {
             ViewMode::Source => {
                 self.ensure_source(window, cx);
@@ -174,6 +175,13 @@ impl Editor {
                 .my_3()
                 .bg(color(theme::RULE))
                 .into_any_element()
+        } else if let Some(seg) = line
+            .segs
+            .first()
+            .filter(|s| line.deco == Deco::Math && self.caret_in(line.block, s).is_none())
+        {
+            // Math line with the caret elsewhere: paint the formula.
+            self.math.display_element(&seg.text, mono.clone(), size)
         } else if let Some(seg) = line.segs.first() {
             let caret = self.caret_in(line.block, seg);
             let sel = self.sel_in(line.block, seg);

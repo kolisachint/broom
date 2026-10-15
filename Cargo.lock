@@ -668,6 +668,7 @@ dependencies = [
  "broom-math",
  "broom-vim",
  "gpui-kit",
+ "image",
 ]
 
 [[package]]

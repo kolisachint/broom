@@ -9,7 +9,11 @@
 // scaffold: remove once the panels and key routing use the editor API.
 #![allow(dead_code)]
 
+mod dialogs;
 mod editor;
+mod right_panel;
+mod safety;
+mod status_bar;
 mod theme;
 mod workspace;
 
