@@ -108,9 +108,14 @@ pub fn backlink_rows(index: &LinkIndex, target: &str) -> Vec<BacklinkRow> {
 }
 
 /// The text of the line that holds the link, trimmed and shortened.
+/// `span` is a byte range. The file may have changed since the index was
+/// built, so the start is moved back to a char boundary.
 fn snippet_for(b: &Backlink) -> String {
     let text = std::fs::read_to_string(&b.source).unwrap_or_default();
-    let start = b.span.start.min(text.len());
+    let mut start = b.span.start.min(text.len());
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
     let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
     let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
     let line = text[line_start..line_end].trim();

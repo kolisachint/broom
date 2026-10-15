@@ -690,6 +690,9 @@ impl Editor {
         if self.doc.is_dirty() {
             cx.emit(EditorEvent::Edited);
         }
+        if let VimOutcome::EditorKey(key) = &out {
+            self.apply_editor_key(*key, cx);
+        }
         if out == VimOutcome::PassThrough && self.vim.mode() == broom_vim::Mode::Insert {
             match ki.key {
                 Key::Char(c) => self.type_text(&c.to_string(), cx),
@@ -705,6 +708,23 @@ impl Editor {
         }
         cx.notify();
         out
+    }
+
+    /// Applies a key vim does not type (arrows, Home, End, Delete, Backspace)
+    /// as an editing key. Nothing is typed.
+    fn apply_editor_key(&mut self, ki: KeyInput, cx: &mut Context<Self>) {
+        match ki.key {
+            Key::Left => self.move_left(false),
+            Key::Right => self.move_right(false),
+            Key::Up => self.move_vertical(-1, false),
+            Key::Down => self.move_vertical(1, false),
+            Key::Home => self.move_line_edge(false, false),
+            Key::End => self.move_line_edge(true, false),
+            Key::Delete => self.delete_forward(cx),
+            Key::Backspace => self.backspace(cx),
+            _ => return,
+        }
+        cx.notify();
     }
 
     pub fn vim_reset(&mut self) {
