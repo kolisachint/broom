@@ -118,13 +118,47 @@ fn snippet_for(b: &Backlink) -> String {
     }
     let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
     let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
-    let line = text[line_start..line_end].trim();
+    let line = strip_markdown(text[line_start..line_end].trim());
     if line.chars().count() > SNIPPET_CHARS {
         let cut: String = line.chars().take(SNIPPET_CHARS).collect();
         format!("{cut}…")
     } else {
-        line.to_string()
+        line
     }
+}
+
+/// Visible text of one source line: emphasis, code marks, heading and list
+/// markers, `[[wiki]]` and `[text](url)` links are reduced to their text.
+fn strip_markdown(line: &str) -> String {
+    let mut s = line.trim_start_matches('#').trim_start().to_string();
+    for marker in ["- [ ] ", "- [x] ", "- ", "> "] {
+        if let Some(rest) = s.strip_prefix(marker) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    // Wiki links: [[target|label]] shows the label, else the target.
+    while let Some(open) = s.find("[[") {
+        let Some(close) = s[open..].find("]]").map(|i| open + i) else {
+            break;
+        };
+        let inner = &s[open + 2..close];
+        let shown = inner.rsplit_once('|').map_or(inner, |(_, label)| label).to_string();
+        s.replace_range(open..close + 2, &shown);
+    }
+    // Markdown links: [text](url) shows the text.
+    while let Some(open) = s.find('[') {
+        let Some(mid) = s[open..].find("](").map(|i| open + i) else {
+            break;
+        };
+        let Some(end) = s[mid..].find(')').map(|i| mid + i) else {
+            break;
+        };
+        let shown = s[open + 1..mid].to_string();
+        s.replace_range(open..=end, &shown);
+    }
+    s.retain(|c| !matches!(c, '*' | '_' | '`'));
+    s.trim().to_string()
 }
 
 /// File name shown for a backlink, falling back to the full path.
@@ -252,5 +286,22 @@ impl Render for RightPanel {
                     .children(rows),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Explicit `test` so gpui_kit's glob-imported `test` macro is not used.
+    use std::prelude::v1::test;
+
+    use super::strip_markdown;
+
+    #[test]
+    fn snippet_shows_visible_text() {
+        assert_eq!(strip_markdown("- **bold** and _em_"), "bold and em");
+        assert_eq!(strip_markdown("see [[other-note]] now"), "see other-note now");
+        assert_eq!(strip_markdown("see [[a|shown]] now"), "see shown now");
+        assert_eq!(strip_markdown("read [docs](https://x.y)"), "read docs");
+        assert_eq!(strip_markdown("## `code` title"), "code title");
     }
 }

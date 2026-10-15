@@ -43,10 +43,10 @@ impl StatusInfo {
     /// Plain-text form, for logs and tests.
     pub fn text(&self) -> String {
         format!(
-            "{}  ·  {}  ·  {} words  ·  {}",
+            "{}  ·  {}  ·  {}  ·  {}",
             self.mode,
             self.name,
-            self.words,
+            word_label(self.words),
             self.save.label()
         )
     }
@@ -66,6 +66,15 @@ pub fn bar(info: &StatusInfo) -> Div {
         .text_sm()
         .child(div().font_weight(FontWeight::BOLD).child(info.mode.clone()))
         .child(div().flex_1().min_w_0().truncate().child(info.name.clone()))
-        .child(format!("{} words", info.words))
+        .child(word_label(info.words))
         .child(div().font_weight(FontWeight::BOLD).child(info.save.label()))
+}
+
+/// `1 word`, `2 words`, `0 words`.
+fn word_label(n: usize) -> String {
+    if n == 1 {
+        "1 word".to_string()
+    } else {
+        format!("{n} words")
+    }
 }
