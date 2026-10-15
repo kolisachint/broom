@@ -23,6 +23,7 @@ use gpui_kit::*;
 
 use crate::editor::{Editor, EditorEvent, EditorStyle, ViewMode};
 use crate::keys::Run;
+use crate::tabs::Tabs;
 use crate::{theme, zen};
 
 /// Pane widths in logical pixels.
@@ -38,6 +39,8 @@ pub struct Workspace {
     pub center: Option<Entity<Editor>>,
     /// Right panel. `None` draws the empty placeholder pane.
     pub right: Option<AnyView>,
+    /// Editor tabs. The active tab's editor is `center`. Set by `tree_panel::install`.
+    pub tabs: Option<Entity<Tabs>>,
     /// Status bar text. Refreshed from the editor on every edit.
     pub status: SharedString,
     /// Zen mode: panels and status bar hidden, centre column narrowed.
@@ -85,11 +88,13 @@ impl Workspace {
             left: None,
             center,
             right: None,
+            tabs: None,
             status: SharedString::default(),
             zen: false,
             settings,
             _subs: subs,
         };
+        crate::tree_panel::install(&mut ws, cx);
         ws.refresh_status(cx);
         ws
     }
@@ -157,14 +162,22 @@ impl Workspace {
             Some(editor) => editor.clone().into_any_element(),
             None => "Editor unavailable: no document loaded.".into_any_element(),
         };
-        div()
+        let mut pane = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
-            .h_full()
-            .p_6()
-            .child(zen::column(self.zen, body))
+            .h_full();
+        if let Some(tabs) = &self.tabs {
+            pane = pane.child(tabs.clone());
+        }
+        pane.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .p_6()
+                .child(zen::column(self.zen, body)),
+        )
     }
 }
 

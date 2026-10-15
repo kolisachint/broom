@@ -11,7 +11,9 @@
 
 mod editor;
 mod keys;
+mod tabs;
 mod theme;
+mod tree_panel;
 mod workspace;
 mod zen;
 
