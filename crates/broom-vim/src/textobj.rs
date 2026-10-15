@@ -72,10 +72,7 @@ fn word_range(buf: &dyn VimBuffer, cur: Cursor, around: bool) -> Option<TextRang
             }
         }
     }
-    Some(span(
-        Cursor { line, col: s },
-        Cursor { line, col: e },
-    ))
+    Some(span(Cursor { line, col: s }, Cursor { line, col: e }))
 }
 
 fn paragraph_range(buf: &dyn VimBuffer, cur: Cursor, around: bool) -> Option<TextRange> {
@@ -130,8 +127,8 @@ fn quote_range(q: char, around: bool, buf: &dyn VimBuffer, cur: Cursor) -> Optio
         .map(|(i, _)| i)
         .collect();
     let pair = marks
-        .chunks_exact(2)
-        .find(|p| p[0] <= cur.col && cur.col <= p[1])?;
+        .chunks(2)
+        .find(|p| p.len() == 2 && p[0] <= cur.col && cur.col <= p[1])?;
     let (s, e) = (pair[0], pair[1]);
     let (start, end) = if around { (s, e + 1) } else { (s + 1, e) };
     Some(span(
@@ -249,7 +246,13 @@ mod tests {
         Cursor { line, col }
     }
 
-    fn get(obj: TextObject, around: bool, text: &str, line: usize, col: usize) -> Option<TextRange> {
+    fn get(
+        obj: TextObject,
+        around: bool,
+        text: &str,
+        line: usize,
+        col: usize,
+    ) -> Option<TextRange> {
         range(obj, around, &MockBuffer::at(text, line, col))
     }
 
@@ -259,41 +262,86 @@ mod tests {
 
     #[test]
     fn inner_and_around_word() {
-        assert_eq!(cols(get(TextObject::Word, false, "foo bar", 0, 1)), Some((pos(0, 0), pos(0, 3))));
-        assert_eq!(cols(get(TextObject::Word, true, "foo bar", 0, 1)), Some((pos(0, 0), pos(0, 4))));
-        assert_eq!(cols(get(TextObject::Word, true, "foo bar", 0, 4)), Some((pos(0, 3), pos(0, 7))));
-        assert_eq!(cols(get(TextObject::Word, false, "a  b", 0, 1)), Some((pos(0, 1), pos(0, 3))));
+        assert_eq!(
+            cols(get(TextObject::Word, false, "foo bar", 0, 1)),
+            Some((pos(0, 0), pos(0, 3)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Word, true, "foo bar", 0, 1)),
+            Some((pos(0, 0), pos(0, 4)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Word, true, "foo bar", 0, 4)),
+            Some((pos(0, 3), pos(0, 7)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Word, false, "a  b", 0, 1)),
+            Some((pos(0, 1), pos(0, 3)))
+        );
     }
 
     #[test]
     fn paragraph_inner_and_around() {
         let text = "a\nb\n\nc";
-        assert_eq!(cols(get(TextObject::Paragraph, false, text, 0, 0)), Some((pos(0, 0), pos(2, 0))));
-        assert_eq!(cols(get(TextObject::Paragraph, true, text, 0, 0)), Some((pos(0, 0), pos(3, 0))));
-        assert_eq!(cols(get(TextObject::Paragraph, false, text, 3, 0)), Some((pos(3, 0), pos(3, 1))));
+        assert_eq!(
+            cols(get(TextObject::Paragraph, false, text, 0, 0)),
+            Some((pos(0, 0), pos(2, 0)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Paragraph, true, text, 0, 0)),
+            Some((pos(0, 0), pos(3, 0)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Paragraph, false, text, 3, 0)),
+            Some((pos(3, 0), pos(3, 1)))
+        );
     }
 
     #[test]
     fn quote_inner_and_around() {
         let text = "say \"hi there\" ok";
-        assert_eq!(cols(get(TextObject::Quote('"'), false, text, 0, 6)), Some((pos(0, 5), pos(0, 13))));
-        assert_eq!(cols(get(TextObject::Quote('"'), true, text, 0, 6)), Some((pos(0, 4), pos(0, 14))));
-        assert_eq!(cols(get(TextObject::Quote('"'), false, "no quotes", 0, 2)), None);
+        assert_eq!(
+            cols(get(TextObject::Quote('"'), false, text, 0, 6)),
+            Some((pos(0, 5), pos(0, 13)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Quote('"'), true, text, 0, 6)),
+            Some((pos(0, 4), pos(0, 14)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Quote('"'), false, "no quotes", 0, 2)),
+            None
+        );
     }
 
     #[test]
     fn pair_inner_and_around() {
         let text = "f(a, (b), c)";
-        assert_eq!(cols(get(TextObject::Pair('('), false, text, 0, 6)), Some((pos(0, 6), pos(0, 7))));
-        assert_eq!(cols(get(TextObject::Pair('('), true, text, 0, 6)), Some((pos(0, 5), pos(0, 8))));
-        assert_eq!(cols(get(TextObject::Pair('('), false, text, 0, 10)), Some((pos(0, 2), pos(0, 11))));
-        assert_eq!(cols(get(TextObject::Pair('('), false, "x(y)", 0, 1)), Some((pos(0, 2), pos(0, 3))));
+        assert_eq!(
+            cols(get(TextObject::Pair('('), false, text, 0, 6)),
+            Some((pos(0, 6), pos(0, 7)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Pair('('), true, text, 0, 6)),
+            Some((pos(0, 5), pos(0, 8)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Pair('('), false, text, 0, 10)),
+            Some((pos(0, 2), pos(0, 11)))
+        );
+        assert_eq!(
+            cols(get(TextObject::Pair('('), false, "x(y)", 0, 1)),
+            Some((pos(0, 2), pos(0, 3)))
+        );
     }
 
     #[test]
     fn pair_spans_lines() {
         let text = "x(\n y\n)";
-        assert_eq!(cols(get(TextObject::Pair('('), false, text, 1, 1)), Some((pos(0, 2), pos(2, 0))));
+        assert_eq!(
+            cols(get(TextObject::Pair('('), false, text, 1, 1)),
+            Some((pos(0, 2), pos(2, 0)))
+        );
         assert_eq!(cols(get(TextObject::Pair('['), false, text, 1, 1)), None);
     }
 }

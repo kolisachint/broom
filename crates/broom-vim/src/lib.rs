@@ -14,16 +14,14 @@
 //! [`VimOutcome::PassThrough`]. The editor then types them with
 //! `Document::insert_typed`, so input rules still run.
 
-#![allow(unused_variables, dead_code)] // scaffold: remove as stubs are implemented
-
 pub mod buffer;
 pub mod key;
 pub mod machine;
+#[cfg(test)]
+mod mock;
 pub mod motion;
 pub mod register;
 pub mod textobj;
-#[cfg(test)]
-mod mock;
 
 pub use broom_config::Command;
 pub use buffer::{Cursor, Selection, TextRange, VimBuffer};

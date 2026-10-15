@@ -301,10 +301,9 @@ impl Vim {
             self.pending.count = Some(self.pending.count.unwrap_or(0) * 10 + d);
             return VimOutcome::Handled;
         }
-        if visual {
-            if let Some(out) = self.visual_op(c, buf) {
-                return out;
-            }
+        let visual_out = if visual { self.visual_op(c, buf) } else { None };
+        if let Some(out) = visual_out {
+            return out;
         }
         if let Some(m) = motion_for(c) {
             return self.motion(m, buf);
@@ -646,7 +645,10 @@ impl Vim {
                     line: r.end.line,
                     col: r.end.col.saturating_sub(1),
                 };
-                buf.set_selection(Some(Selection { anchor: r.start, head }));
+                buf.set_selection(Some(Selection {
+                    anchor: r.start,
+                    head,
+                }));
                 buf.set_cursor(head);
             }
             None => {}
@@ -708,13 +710,26 @@ impl Vim {
                     };
                     buf.insert_text(at, &format!("{body}\n"));
                     let col = motion::first_nonblank(buf, cur.line);
-                    buf.set_cursor(Cursor { line: cur.line, col });
+                    buf.set_cursor(Cursor {
+                        line: cur.line,
+                        col,
+                    });
                 }
             }
             RegisterKind::Charwise => {
                 let len = buf.line_len(cur.line);
-                let col = if after && len > 0 { cur.col + 1 } else { cur.col };
-                let end = buf.insert_text(Cursor { line: cur.line, col }, &text.repeat(n));
+                let col = if after && len > 0 {
+                    cur.col + 1
+                } else {
+                    cur.col
+                };
+                let end = buf.insert_text(
+                    Cursor {
+                        line: cur.line,
+                        col,
+                    },
+                    &text.repeat(n),
+                );
                 let p = Cursor {
                     line: end.line,
                     col: end.col.saturating_sub(1),
@@ -815,7 +830,10 @@ fn lines_range(a: usize, b: usize, buf: &dyn VimBuffer) -> TextRange {
     if b < last {
         TextRange {
             start: Cursor { line: a, col: 0 },
-            end: Cursor { line: b + 1, col: 0 },
+            end: Cursor {
+                line: b + 1,
+                col: 0,
+            },
         }
     } else if a > 0 {
         TextRange {
@@ -1073,33 +1091,69 @@ mod tests {
 
     #[test]
     fn gd_and_heading_sequences_return_commands() {
-        assert_eq!(outcomes("a", "gd").last(), Some(&VimOutcome::Command(Command::FollowLink)));
-        assert_eq!(outcomes("a", "]]").last(), Some(&VimOutcome::Command(Command::NextHeading)));
-        assert_eq!(outcomes("a", "[[").last(), Some(&VimOutcome::Command(Command::PrevHeading)));
+        assert_eq!(
+            outcomes("a", "gd").last(),
+            Some(&VimOutcome::Command(Command::FollowLink))
+        );
+        assert_eq!(
+            outcomes("a", "]]").last(),
+            Some(&VimOutcome::Command(Command::NextHeading))
+        );
+        assert_eq!(
+            outcomes("a", "[[").last(),
+            Some(&VimOutcome::Command(Command::PrevHeading))
+        );
         assert_eq!(outcomes("a", "g").last(), Some(&VimOutcome::Handled));
     }
 
     #[test]
     fn leader_keys_return_commands() {
-        assert_eq!(outcomes("a", " f").last(), Some(&VimOutcome::Command(Command::QuickOpen)));
-        assert_eq!(outcomes("a", " z").last(), Some(&VimOutcome::Command(Command::ZenMode)));
-        assert_eq!(outcomes("a", " e").last(), Some(&VimOutcome::Command(Command::ToggleTree)));
-        assert_eq!(outcomes("a", " o").last(), Some(&VimOutcome::Command(Command::Outline)));
-        assert_eq!(outcomes("a", " p").last(), Some(&VimOutcome::Command(Command::CommandPalette)));
-        assert_eq!(outcomes("a", " /").last(), Some(&VimOutcome::Command(Command::SearchFolder)));
+        assert_eq!(
+            outcomes("a", " f").last(),
+            Some(&VimOutcome::Command(Command::QuickOpen))
+        );
+        assert_eq!(
+            outcomes("a", " z").last(),
+            Some(&VimOutcome::Command(Command::ZenMode))
+        );
+        assert_eq!(
+            outcomes("a", " e").last(),
+            Some(&VimOutcome::Command(Command::ToggleTree))
+        );
+        assert_eq!(
+            outcomes("a", " o").last(),
+            Some(&VimOutcome::Command(Command::Outline))
+        );
+        assert_eq!(
+            outcomes("a", " p").last(),
+            Some(&VimOutcome::Command(Command::CommandPalette))
+        );
+        assert_eq!(
+            outcomes("a", " /").last(),
+            Some(&VimOutcome::Command(Command::SearchFolder))
+        );
         assert_eq!(outcomes("a", " q").last(), Some(&VimOutcome::Handled));
     }
 
     #[test]
     fn undo_and_redo_are_commands() {
-        assert_eq!(outcomes("a", "u").last(), Some(&VimOutcome::Command(Command::Undo)));
+        assert_eq!(
+            outcomes("a", "u").last(),
+            Some(&VimOutcome::Command(Command::Undo))
+        );
         let mut v = vim();
         let mut b = MockBuffer::new("a");
         let redo = KeyInput {
             key: Key::Char('r'),
-            mods: crate::key::Modifiers { ctrl: true, ..Default::default() },
+            mods: crate::key::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
         };
-        assert_eq!(v.handle_key(redo, &mut b), VimOutcome::Command(Command::Redo));
+        assert_eq!(
+            v.handle_key(redo, &mut b),
+            VimOutcome::Command(Command::Redo)
+        );
     }
 
     #[test]
@@ -1108,7 +1162,10 @@ mod tests {
         let mut b = MockBuffer::new("a");
         let save = KeyInput {
             key: Key::Char('s'),
-            mods: crate::key::Modifiers { cmd: true, ..Default::default() },
+            mods: crate::key::Modifiers {
+                cmd: true,
+                ..Default::default()
+            },
         };
         assert_eq!(v.handle_key(save, &mut b), VimOutcome::PassThrough);
     }
@@ -1145,7 +1202,13 @@ mod tests {
         let mut v = vim();
         let mut b = MockBuffer::new("abc");
         run(&mut v, &mut b, "vl");
-        assert_eq!(b.selection(), Some(Selection { anchor: Cursor { line: 0, col: 0 }, head: Cursor { line: 0, col: 1 } }));
+        assert_eq!(
+            b.selection(),
+            Some(Selection {
+                anchor: Cursor { line: 0, col: 0 },
+                head: Cursor { line: 0, col: 1 }
+            })
+        );
     }
 
     #[test]

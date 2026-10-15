@@ -33,11 +33,17 @@ pub enum Motion {
     Up,
     Down,
     /// `w` (`big` false) or `W` (`big` true).
-    WordForward { big: bool },
+    WordForward {
+        big: bool,
+    },
     /// `b` / `B`.
-    WordBack { big: bool },
+    WordBack {
+        big: bool,
+    },
     /// `e` / `E`.
-    WordEnd { big: bool },
+    WordEnd {
+        big: bool,
+    },
     /// `0`.
     LineStart,
     /// `^`.
@@ -51,7 +57,10 @@ pub enum Motion {
     /// `f`, `F`, `t`, `T`.
     Find(Find),
     /// `;` (`reverse` false) or `,` (`reverse` true) of the last search `find`.
-    RepeatFind { find: Find, reverse: bool },
+    RepeatFind {
+        find: Find,
+        reverse: bool,
+    },
     /// `]]`: next heading.
     NextHeading,
     /// `[[`: previous heading.
@@ -468,9 +477,15 @@ mod tests {
         assert_eq!(first, pos(0, 1));
         let mut b = at("a,b,c", 0, 1);
         b.set_cursor(first);
-        let next = Motion::RepeatFind { find, reverse: false };
+        let next = Motion::RepeatFind {
+            find,
+            reverse: false,
+        };
         assert_eq!(apply(next, 1, &b), pos(0, 3));
-        let prev = Motion::RepeatFind { find, reverse: true };
+        let prev = Motion::RepeatFind {
+            find,
+            reverse: true,
+        };
         b.set_cursor(pos(0, 3));
         assert_eq!(apply(prev, 1, &b), pos(0, 1));
     }
@@ -490,7 +505,10 @@ mod tests {
     fn kinds_match_vim() {
         assert_eq!(Motion::Down.kind(), MotionKind::Linewise);
         assert_eq!(Motion::FileEnd.kind(), MotionKind::Linewise);
-        assert_eq!(Motion::WordForward { big: false }.kind(), MotionKind::Exclusive);
+        assert_eq!(
+            Motion::WordForward { big: false }.kind(),
+            MotionKind::Exclusive
+        );
         assert_eq!(Motion::WordEnd { big: true }.kind(), MotionKind::Inclusive);
         assert_eq!(Motion::LineEnd.kind(), MotionKind::Inclusive);
         assert_eq!(Motion::Find(fwd('a', true)).kind(), MotionKind::Inclusive);
