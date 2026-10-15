@@ -10,9 +10,11 @@
 //! Modes: [`Mode::Normal`], [`Mode::Insert`], [`Mode::Visual`], [`Mode::VisualLine`].
 //! Labels for the status bar: `NORMAL`, `INSERT`, `VISUAL`, `V-LINE`.
 //!
-//! Insert mode: printable keys, Enter, Backspace, Tab return
+//! Insert mode: plain printable keys, Enter, Backspace, Tab return
 //! [`VimOutcome::PassThrough`]. The editor then types them with
-//! `Document::insert_typed`, so input rules still run.
+//! `Document::insert_typed`, so input rules still run. Ctrl/Alt chords,
+//! arrows, Home/End and Delete return [`VimOutcome::EditorKey`]: the editor
+//! applies them as plain editing keys (they are never typed as text).
 
 pub mod buffer;
 pub mod key;

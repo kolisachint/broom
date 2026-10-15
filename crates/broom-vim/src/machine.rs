@@ -11,7 +11,7 @@
 
 use crate::buffer::{Cursor, Selection, TextRange, VimBuffer};
 use crate::key::{Key, KeyInput};
-use crate::motion::{self, Find, Motion, MotionKind};
+use crate::motion::{self, Find, Motion, MotionKind, char_class};
 use crate::register::{Register, RegisterKind};
 use crate::textobj::{self, TextObject};
 use broom_config::{Command, VimBindings};
@@ -48,6 +48,9 @@ pub enum VimOutcome {
     PassThrough,
     /// An app command (leader keys, `gd`, `]]` / `[[`, `u`, `Ctrl+r`).
     Command(Command),
+    /// Insert mode: a key vim does not type (Ctrl/Alt chords, arrows, Delete).
+    /// The editor applies it as a plain editing key (cursor move, etc.).
+    EditorKey(KeyInput),
 }
 
 /// Vim state. One per editor pane.
@@ -70,6 +73,11 @@ pub struct Vim {
     typed: String,
     // True while `.` replays keys. Replayed keys do not overwrite the last change.
     replaying: bool,
+    // Column kept across j/k. `usize::MAX` after `$`. `None` after any other move.
+    want_col: Option<usize>,
+    // Count given to the current insert session, and whether it opened a line.
+    insert_count: usize,
+    insert_opens: bool,
 }
 
 // Keys typed so far that are not yet a complete command.
@@ -121,6 +129,9 @@ impl Vim {
             insert_entry: Vec::new(),
             typed: String::new(),
             replaying: false,
+            want_col: None,
+            insert_count: 1,
+            insert_opens: false,
         }
     }
 
@@ -163,7 +174,12 @@ impl Vim {
             return VimOutcome::PassThrough;
         }
         if self.mode == Mode::Insert {
+            self.want_col = None;
             return self.insert_key(input, buf);
+        }
+        // j, k and counts keep the sticky column. Other keys reset it.
+        if !matches!(key_char(input.key), Some('j' | 'k' | '0'..='9')) {
+            self.want_col = None;
         }
         if self.mode == Mode::Normal && buf.selection().is_some() {
             buf.set_selection(None);
@@ -208,6 +224,30 @@ fn key_char(key: Key) -> Option<char> {
         Key::Delete => 'x',
         Key::Escape | Key::Enter | Key::Tab => return None,
     })
+}
+
+// No ctrl, alt or cmd: the key types a char.
+fn plain(input: KeyInput) -> bool {
+    !input.mods.ctrl && !input.mods.alt && !input.mods.cmd
+}
+
+// `cw` on a non-blank char: the target is the end of the word, like `ce`.
+// `None` when the cursor is on a blank (then `cw` acts like `dw`).
+fn change_word_target(buf: &dyn VimBuffer, count: usize, big: bool) -> Option<Cursor> {
+    let cur = buf.cursor();
+    let chars: Vec<char> = buf.line(cur.line)?.chars().collect();
+    let cls = char_class(*chars.get(cur.col)?, big);
+    if cls == 0 {
+        return None;
+    }
+    let next_same = chars
+        .get(cur.col + 1)
+        .is_some_and(|c| char_class(*c, big) == cls);
+    let n = if next_same { count } else { count - 1 };
+    if n == 0 {
+        return Some(cur);
+    }
+    Some(motion::apply(Motion::WordEnd { big }, n, buf))
 }
 
 // Clamps to a valid Normal-mode cursor: col at most the last char.
@@ -298,7 +338,13 @@ impl Vim {
         let op_pending = self.pending.operator.is_some();
         if c.is_ascii_digit() && (c != '0' || self.pending.count.is_some()) {
             let d = c.to_digit(10).unwrap_or(0) as usize;
-            self.pending.count = Some(self.pending.count.unwrap_or(0) * 10 + d);
+            self.pending.count = Some(
+                self.pending
+                    .count
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(d),
+            );
             return VimOutcome::Handled;
         }
         let visual_out = if visual { self.visual_op(c, buf) } else { None };
@@ -351,7 +397,7 @@ impl Vim {
                 let len = buf.line_len(cur.line);
                 buf.set_cursor(Cursor {
                     line: cur.line,
-                    col: (cur.col + 1).min(len),
+                    col: cur.col.saturating_add(1).min(len),
                 });
                 self.enter_insert();
                 VimOutcome::Handled
@@ -413,7 +459,7 @@ impl Vim {
         let before = self.pending.op_count.take();
         let after = self.pending.count.take();
         match (before, after) {
-            (Some(a), Some(b)) => Some(a * b),
+            (Some(a), Some(b)) => Some(a.saturating_mul(b)),
             (a, b) => a.or(b),
         }
     }
@@ -441,24 +487,48 @@ impl Vim {
     fn line_op(&mut self, op: char, buf: &mut dyn VimBuffer) -> VimOutcome {
         let n = self.take_count().unwrap_or(1);
         let cur = buf.cursor().line;
-        let end = (cur + n - 1).min(buf.line_count() - 1);
+        let end = cur.saturating_add(n - 1).min(buf.line_count() - 1);
         self.run_op(op, Target::Lines(cur, end), buf);
         VimOutcome::Handled
     }
 
     // Runs a motion: moves the cursor, or applies the pending operator.
     fn motion(&mut self, m: Motion, buf: &mut dyn VimBuffer) -> VimOutcome {
+        let want = self.want_col;
+        let cur = buf.cursor();
         let n = self.take_count();
         let count = match (m, n) {
             (Motion::FileEnd, None) => buf.line_count(),
             _ => n.unwrap_or(1),
         };
-        let target = motion::apply(m, count, buf);
+        let mut m = m;
+        let mut target = motion::apply(m, count, buf);
         if let Some(op) = self.pending.operator.take() {
+            self.want_col = None;
+            // `cw` on a word changes to its end, like `ce`.
+            let change_word = match (m, op) {
+                (Motion::WordForward { big }, 'c') => {
+                    change_word_target(buf, count, big).map(|t| (Motion::WordEnd { big }, t))
+                }
+                _ => None,
+            };
+            if let Some((word_end, t)) = change_word {
+                m = word_end;
+                target = t;
+            }
             self.apply_motion_operator(op, m, target, buf);
             return VimOutcome::Handled;
         }
         self.pending = Pending::default();
+        self.want_col = match m {
+            Motion::Up | Motion::Down => Some(want.unwrap_or(cur.col)),
+            Motion::LineEnd => Some(usize::MAX),
+            _ => None,
+        };
+        if matches!(m, Motion::Up | Motion::Down) {
+            let col = want.unwrap_or(cur.col);
+            target.col = col;
+        }
         let p = clamp_normal(buf, target);
         let anchor = buf.selection().map_or(p, |s| s.anchor);
         buf.set_cursor(p);
@@ -476,6 +546,18 @@ impl Vim {
         buf: &mut dyn VimBuffer,
     ) {
         let cur = buf.cursor();
+        // j or k with no line to go to: nothing happens.
+        if matches!(m, Motion::Up | Motion::Down) && target.line == cur.line {
+            return;
+        }
+        // `dw` on a line's last word stops at the line end, not the next line.
+        let target = match m {
+            Motion::WordForward { .. } if target.line > cur.line => Cursor {
+                line: cur.line,
+                col: buf.line_len(cur.line),
+            },
+            _ => target,
+        };
         if m.kind() == MotionKind::Linewise {
             let (a, b) = (cur.line.min(target.line), cur.line.max(target.line));
             self.run_op(op, Target::Lines(a, b), buf);
@@ -533,6 +615,16 @@ impl Vim {
                 buf.set_cursor(p);
                 self.record_change();
             }
+            Target::Chars(r) if r.start == r.end => {
+                // Nothing to act on: keep the register and last change as they were.
+                if op == 'c' {
+                    buf.set_cursor(r.start);
+                    self.enter_insert();
+                } else {
+                    let p = clamp_normal(buf, r.start);
+                    buf.set_cursor(p);
+                }
+            }
             Target::Chars(r) => {
                 let text = buf.text_in_range(r);
                 self.register.set(text, RegisterKind::Charwise);
@@ -556,6 +648,9 @@ impl Vim {
 
     // Visual-mode operator keys. `None` for other keys.
     fn visual_op(&mut self, c: char, buf: &mut dyn VimBuffer) -> Option<VimOutcome> {
+        if c == 'p' || c == 'P' {
+            return Some(self.visual_paste(buf));
+        }
         let (op, linewise) = match c {
             'd' | 'x' => ('d', false),
             'c' | 's' => ('c', false),
@@ -580,6 +675,20 @@ impl Vim {
         Some(VimOutcome::Handled)
     }
 
+    // Visual `p` / `P`: deletes the selection, then pastes the old register.
+    fn visual_paste(&mut self, buf: &mut dyn VimBuffer) -> VimOutcome {
+        let target = self.selection_target(false, buf);
+        let saved = self.register.clone();
+        self.run_op('d', target, buf);
+        let deleted = std::mem::replace(&mut self.register, saved);
+        if let Target::Chars(r) = target {
+            buf.set_cursor(r.start);
+        }
+        self.paste(false, buf);
+        self.register = deleted;
+        VimOutcome::Handled
+    }
+
     // The visual selection as an operator target.
     fn selection_target(&self, linewise: bool, buf: &dyn VimBuffer) -> Target {
         let cur = buf.cursor();
@@ -596,7 +705,7 @@ impl Vim {
             return Target::Lines(s.line, e.line);
         }
         // Visual selections include the char under the head.
-        e.col = (e.col + 1).min(buf.line_len(e.line));
+        e.col = e.col.saturating_add(1).min(buf.line_len(e.line));
         Target::Chars(TextRange { start: s, end: e })
     }
 
@@ -638,6 +747,25 @@ impl Vim {
         let Some(r) = textobj::range(obj, around, buf) else {
             return VimOutcome::Handled;
         };
+        if obj == TextObject::Paragraph {
+            let a = r.start.line;
+            let b = if r.end.col == 0 && r.end.line > a {
+                r.end.line - 1
+            } else {
+                r.end.line
+            };
+            match op {
+                Some(op) => self.run_op(op, Target::Lines(a, b), buf),
+                None if self.is_visual() => {
+                    self.mode = Mode::VisualLine;
+                    let (anchor, head) = (Cursor { line: a, col: 0 }, Cursor { line: b, col: 0 });
+                    buf.set_selection(Some(Selection { anchor, head }));
+                    buf.set_cursor(head);
+                }
+                None => {}
+            }
+            return VimOutcome::Handled;
+        }
         match op {
             Some(op) => self.run_op(op, Target::Chars(r), buf),
             None if self.is_visual() => {
@@ -657,6 +785,8 @@ impl Vim {
     }
 
     fn enter_insert(&mut self) {
+        self.insert_count = self.take_count().unwrap_or(1);
+        self.insert_opens = false;
         self.mode = Mode::Insert;
         self.pending = Pending::default();
         self.typed.clear();
@@ -681,6 +811,7 @@ impl Vim {
         let line = if above { cur.line } else { after.line };
         buf.set_cursor(Cursor { line, col: 0 });
         self.enter_insert();
+        self.insert_opens = true;
     }
 
     // `p` / `P`. Linewise text opens lines; charwise text goes in the line.
@@ -700,7 +831,7 @@ impl Vim {
                         col: buf.line_len(cur.line),
                     };
                     buf.insert_text(at, &format!("\n{body}"));
-                    let line = cur.line + 1;
+                    let line = cur.line.saturating_add(1);
                     let col = motion::first_nonblank(buf, line);
                     buf.set_cursor(Cursor { line, col });
                 } else {
@@ -719,7 +850,7 @@ impl Vim {
             RegisterKind::Charwise => {
                 let len = buf.line_len(cur.line);
                 let col = if after && len > 0 {
-                    cur.col + 1
+                    cur.col.saturating_add(1)
                 } else {
                     cur.col
                 };
@@ -770,6 +901,7 @@ impl Vim {
                     let at = buf.cursor();
                     let end = buf.insert_text(at, &text);
                     buf.set_cursor(end);
+                    self.typed = text;
                     self.insert_escape(buf);
                 }
             }
@@ -784,7 +916,7 @@ impl Vim {
                 self.insert_escape(buf);
                 VimOutcome::Handled
             }
-            Key::Char(c) if !input.mods.ctrl && !input.mods.alt => {
+            Key::Char(c) if plain(input) => {
                 self.typed.push(c);
                 VimOutcome::PassThrough
             }
@@ -800,7 +932,7 @@ impl Vim {
                 self.typed.pop();
                 VimOutcome::PassThrough
             }
-            _ => VimOutcome::PassThrough,
+            _ => VimOutcome::EditorKey(input),
         }
     }
 
@@ -812,6 +944,19 @@ impl Vim {
                 text: self.typed.clone(),
             });
         }
+        // `3ix<Esc>`: the typed text goes in two more times.
+        let extra = self.insert_count.saturating_sub(1);
+        if extra > 0 && !self.typed.is_empty() {
+            let unit = if self.insert_opens {
+                format!("\n{}", self.typed)
+            } else {
+                self.typed.clone()
+            };
+            let at = buf.cursor();
+            let end = buf.insert_text(at, &unit.repeat(extra));
+            buf.set_cursor(end);
+        }
+        self.insert_count = 1;
         let c = buf.cursor();
         let p = clamp_normal(
             buf,
@@ -938,7 +1083,7 @@ mod tests {
         for key in keys_in {
             let inserting = v.mode() == Mode::Insert;
             let typed = match key.key {
-                Key::Char(c) => c.to_string(),
+                Key::Char(c) if plain(key) => c.to_string(),
                 Key::Enter => "\n".to_string(),
                 _ => String::new(),
             };
@@ -1045,7 +1190,7 @@ mod tests {
 
     #[test]
     fn change_commands_enter_insert() {
-        assert_eq!(edit("foo bar", "cwxy<Esc>"), "xybar");
+        assert_eq!(edit("foo bar", "cwxy<Esc>"), "xy bar");
         assert_eq!(edit("abc def", "wCx<Esc>"), "abc x");
         assert_eq!(edit("foo bar", "ciwX<Esc>"), "X bar");
         assert_eq!(edit("f(a, b)", "f(di("), "f()");
@@ -1229,5 +1374,120 @@ mod tests {
         assert_eq!(edit("a", "Ab<Esc>"), "ab");
         assert_eq!(edit("ac", "ab<Esc>"), "abc");
         assert_eq!(edit("  a", "Ib<Esc>"), "  ba");
+    }
+
+    #[test]
+    fn cw_changes_to_word_end() {
+        assert_eq!(edit("ab cd", "lcwX<Esc>"), "aX cd");
+        assert_eq!(edit("a  b", "lcwX<Esc>"), "aXb");
+        assert_eq!(edit("foo bar baz", "c2wX<Esc>"), "X baz");
+    }
+
+    #[test]
+    fn dw_on_last_word_stops_at_line_end() {
+        assert_eq!(edit("foo\n  bar", "dw"), "\n  bar");
+        let mut v = vim();
+        let mut b = MockBuffer::new("foo\n  bar");
+        run(&mut v, &mut b, "yw");
+        assert_eq!(v.register.text(), "foo");
+    }
+
+    #[test]
+    fn sticky_column_across_j_and_k() {
+        assert_eq!(
+            cursor_after("abcdef\nx\nabcdef", "lllljj"),
+            Cursor { line: 2, col: 4 }
+        );
+        assert_eq!(
+            cursor_after("abcdef\nab\nabcdef", "$jj"),
+            Cursor { line: 2, col: 5 }
+        );
+        assert_eq!(
+            cursor_after("abcdef\nab", "$jk"),
+            Cursor { line: 0, col: 5 }
+        );
+        // A horizontal move resets the column.
+        assert_eq!(
+            cursor_after("abcdef\nab\nabcdef", "$jhj"),
+            Cursor { line: 2, col: 0 }
+        );
+    }
+
+    #[test]
+    fn dj_and_dk_at_edges_do_nothing() {
+        assert_eq!(edit("a\nb", "jdj"), "a\nb");
+        assert_eq!(edit("a\nb", "dk"), "a\nb");
+        assert_eq!(edit("a\nb\nc", "j5dj"), "a");
+    }
+
+    #[test]
+    fn empty_range_keeps_register_and_last_change() {
+        assert_eq!(edit("abc\n\nz", "yyjxp"), "abc\n\nabc\nz");
+        assert_eq!(edit("", "cl"), "");
+        assert_eq!(edit("", "clX<Esc>"), "X");
+    }
+
+    #[test]
+    fn paragraph_objects_are_linewise() {
+        assert_eq!(edit("a\nb\n\nc", "yipGp"), "a\nb\n\nc\na\nb");
+        assert_eq!(edit("a\nb\n\nc", "dip"), "\nc");
+        let mut v = vim();
+        let mut b = MockBuffer::new("a\nb\n\nc");
+        run(&mut v, &mut b, "vip");
+        assert_eq!(v.mode(), Mode::VisualLine);
+        assert_eq!(b.cursor(), Cursor { line: 1, col: 0 });
+    }
+
+    #[test]
+    fn repeat_till_skips_adjacent_match() {
+        assert_eq!(cursor_after("a,b,c", "t,;"), Cursor { line: 0, col: 2 });
+        assert_eq!(cursor_after("a,b,c,d", "t,;;"), Cursor { line: 0, col: 4 });
+    }
+
+    #[test]
+    fn insert_chords_and_navigation_are_editor_keys() {
+        let mut v = vim();
+        let mut b = MockBuffer::new("ab");
+        v.handle_key(KeyInput::char('i'), &mut b);
+        let ctrl_w = KeyInput {
+            key: Key::Char('w'),
+            mods: crate::key::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(v.handle_key(ctrl_w, &mut b), VimOutcome::EditorKey(ctrl_w));
+        let left = KeyInput::plain(Key::Left);
+        assert_eq!(v.handle_key(left, &mut b), VimOutcome::EditorKey(left));
+        assert_eq!(
+            v.handle_key(KeyInput::plain(Key::Delete), &mut b),
+            VimOutcome::EditorKey(KeyInput::plain(Key::Delete))
+        );
+        assert_eq!(
+            v.handle_key(KeyInput::char('x'), &mut b),
+            VimOutcome::PassThrough
+        );
+    }
+
+    #[test]
+    fn insert_count_repeats_text() {
+        assert_eq!(edit("", "3ix<Esc>"), "xxx");
+        assert_eq!(edit("a", "3ox<Esc>"), "a\nx\nx\nx");
+        assert_eq!(edit("", "2ahi<Esc>"), "hihi");
+    }
+
+    #[test]
+    fn visual_p_replaces_selection() {
+        assert_eq!(edit("foo bar", "yiwwviwp"), "foo foo");
+        let mut v = vim();
+        let mut b = MockBuffer::new("foo bar");
+        run(&mut v, &mut b, "yiwwviwp");
+        assert_eq!(v.register.text(), "bar");
+    }
+
+    #[test]
+    fn huge_counts_do_not_overflow() {
+        assert_eq!(edit("a", "99999999999999999999999999999dd"), "");
+        assert_eq!(edit("a", "99999999999999999999999999999x"), "");
     }
 }

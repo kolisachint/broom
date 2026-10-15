@@ -579,16 +579,30 @@ mod tests {
     #[test]
     fn repeat_till_skips_adjacent_match() {
         let text = "a,b,c";
-        let t = Find { ch: ',', forward: true, till: true };
+        let t = Find {
+            ch: ',',
+            forward: true,
+            till: true,
+        };
         let b = at(text, 0, 0);
         assert_eq!(apply(Motion::Find(t), 1, &b), pos(0, 0));
         let mut b = at(text, 0, 0);
         b.set_cursor(pos(0, 0));
-        let next = Motion::RepeatFind { find: t, reverse: false };
+        let next = Motion::RepeatFind {
+            find: t,
+            reverse: false,
+        };
         assert_eq!(apply(next, 1, &b), pos(0, 2));
-        let back = Find { ch: 'a', forward: false, till: true };
+        let back = Find {
+            ch: 'a',
+            forward: false,
+            till: true,
+        };
         let b = at("abcd", 0, 3);
-        let prev = Motion::RepeatFind { find: back, reverse: false };
+        let prev = Motion::RepeatFind {
+            find: back,
+            reverse: false,
+        };
         assert_eq!(apply(prev, 1, &b), pos(0, 1));
     }
 }
