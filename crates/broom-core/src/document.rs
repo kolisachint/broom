@@ -29,6 +29,17 @@ pub struct Document {
     pub(crate) saved_revision: u64,
     /// Set when an inline rule fired: the next typed chunk is plain text.
     pub(crate) pending_plain: bool,
+    /// The file used CRLF line endings. Edited blocks are written the same way.
+    pub(crate) crlf: bool,
+}
+
+/// Pasted `\r\n` and `\r` become `\n`. Blocks are written back with the file's style.
+pub(crate) fn normalize_newlines(text: &str) -> String {
+    if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.to_string()
+    }
 }
 
 impl Clone for Document {
@@ -52,6 +63,7 @@ impl Document {
             revision: 0,
             saved_revision: 0,
             pending_plain: false,
+            crlf: false,
         }
     }
 
@@ -64,6 +76,7 @@ impl Document {
             revision: 0,
             saved_revision: 0,
             pending_plain: false,
+            crlf: src.contains("\r\n"),
         }
     }
 
@@ -178,6 +191,8 @@ impl Document {
     /// `text` may contain `\n`, which splits the block (see [`Document::split_block`]).
     /// Returns the cursor just after the inserted text.
     pub fn insert_text(&mut self, pos: DocPos, text: &str) -> Result<DocPos, EditError> {
+        let text = normalize_newlines(text);
+        let text = text.as_str();
         self.validate_insert(pos, text)?;
         if text.is_empty() {
             return Ok(pos);
@@ -189,7 +204,7 @@ impl Document {
     /// Inserts one typed chunk and runs input rules (see [`crate::input_rules`]).
     /// Use for keyboard input in Insert mode and in WYSIWYG editing.
     pub fn insert_typed(&mut self, pos: DocPos, text: &str) -> Result<InputRuleOutcome, EditError> {
-        crate::input_rules::insert_typed(self, pos, text)
+        crate::input_rules::insert_typed(self, pos, &normalize_newlines(text))
     }
 
     /// Deletes `range`. A range across blocks merges the blocks it spans.
@@ -386,6 +401,7 @@ impl Document {
             revision: self.revision,
             saved_revision: self.saved_revision,
             pending_plain: false,
+            crlf: self.crlf,
         }
     }
 
@@ -607,6 +623,26 @@ mod edit_tests {
         let r = DocRange::new(at(0, 0), at(0, 3));
         assert!(matches!(doc.delete_range(r), Err(EditError::Unsupported(_))));
         assert_eq!(doc.to_markdown(), src);
+    }
+
+    #[test]
+    fn crlf_files_keep_crlf_and_pastes_are_normalized() {
+        let mut doc = Document::parse("one\r\n\r\ntwo\r\n");
+        doc.insert_text(at(0, 0), "a\r\nb").unwrap();
+        assert_eq!(doc.to_markdown(), "a\r\n\r\nbone\r\n\r\ntwo\r\n");
+        let code = Document::parse("```\r\na\r\nb\r\n```\r\n");
+        assert!(matches!(code.block(0).unwrap().kind(), BlockKind::CodeBlock { text, .. } if text == "a\nb"));
+        let mut plain = Document::parse("one\n");
+        plain.insert_text(at(0, 0), "x\r\ny").unwrap();
+        assert!(!plain.to_markdown().contains('\r'));
+    }
+
+    #[test]
+    fn setext_multiline_heading_flattens_when_edited() {
+        let mut doc = Document::parse("alpha\nbeta\n===\n");
+        doc.insert_text(at(0, 0), "x").unwrap();
+        assert_eq!(doc.visible_text(0).unwrap(), "xalpha beta");
+        assert_eq!(doc.to_markdown(), "# xalpha beta\n");
     }
 
     #[test]

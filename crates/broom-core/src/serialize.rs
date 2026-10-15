@@ -14,7 +14,10 @@ pub(crate) fn reserialize(old_source: &str, kind: &BlockKind) -> String {
 /// first newline after the last non-space char. Spaces before that are content.
 pub(crate) fn trailing_of(source: &str) -> &str {
     let body_end = source.trim_end().len();
-    match source[body_end..].find('\n') {
+    let rest = &source[body_end..];
+    match rest.find('\n') {
+        // A CRLF line break starts with its '\r'.
+        Some(i) if rest[..i].ends_with('\r') => &source[body_end + i - 1..],
         Some(i) => &source[body_end + i..],
         None => "",
     }

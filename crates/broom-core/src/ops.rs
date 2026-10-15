@@ -54,11 +54,28 @@ impl Document {
         Ok(())
     }
 
+    /// Writes `\n` line breaks in `s` the way the document does.
+    pub(crate) fn eol(&self, s: String) -> String {
+        if self.crlf {
+            s.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            s
+        }
+    }
+
     /// Re-serializes block `i` after its kind changed. The result is re-parsed:
     /// if it reads back differently, the block is written as plain escaped text.
     pub(crate) fn sync(&mut self, i: usize) {
         let has_next = i + 1 < self.blocks.len();
+        let crlf = self.crlf;
         let b = &mut self.blocks[i];
+        // A heading is one line: soft breaks from a setext heading become spaces.
+        if let BlockKind::Heading { content, .. } = &mut b.kind {
+            for r in content.iter_mut() {
+                r.text = r.text.replace('\n', " ");
+            }
+            runs::normalize(content);
+        }
         let mut source = reserialize(&b.source, &b.kind);
         if !reads_back(&b.kind, &source) {
             let plain = strip_styles(&b.kind);
@@ -69,6 +86,9 @@ impl Document {
         }
         if has_next {
             source = with_blank_separator(&source);
+        }
+        if crlf {
+            source = source.replace("\r\n", "\n").replace('\n', "\r\n");
         }
         b.source = source;
         b.edited = true;
@@ -181,12 +201,12 @@ impl Document {
                 };
                 // A blank line separates the halves, so they stay two paragraphs.
                 let old_trailing = trailing_of(&self.blocks[b].source).to_string();
-                self.blocks[b].source = format!("{}\n\n", crate::serialize::kind_md(&head_kind));
+                self.blocks[b].source = self.eol(format!("{}\n\n", crate::serialize::kind_md(&head_kind)));
                 self.blocks[b].kind = head_kind;
                 self.blocks[b].edited = true;
                 let mut source = format!("{}{}", crate::serialize::kind_md(&tail_kind), old_trailing);
                 if b + 1 < self.blocks.len() {
-                    source = with_blank_separator(&source);
+                    source = self.eol(with_blank_separator(&source));
                 }
                 self.blocks.insert(
                     b + 1,
