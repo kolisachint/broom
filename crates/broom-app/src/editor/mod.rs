@@ -155,6 +155,12 @@ impl Editor {
         self.reparsed = false;
     }
 
+    /// Marks the document dirty without an edit. Used when the buffer is kept
+    /// over a newer file on disk: the next save must write it.
+    pub fn mark_dirty(&mut self) {
+        self.reparsed = true;
+    }
+
     /// Words in the visible text. Opaque blocks count their source.
     pub fn word_count(&self) -> usize {
         (0..self.doc.block_count())

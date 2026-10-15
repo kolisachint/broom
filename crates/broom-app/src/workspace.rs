@@ -597,8 +597,10 @@ impl Workspace {
     }
 
     /// Keeps the buffer. The disk state is stamped (metadata before the read),
-    /// so the conflict clears, and the buffer autosaves after the usual delay.
-    fn keep_mine(&mut self, _cx: &mut Context<Self>) -> bool {
+    /// so the conflict clears. The buffer is marked dirty, so the status reads
+    /// Unsaved, and it autosaves after the usual delay. A later save writes
+    /// without asking again.
+    fn keep_mine(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(path) = self.path.clone() else {
             return true;
         };
@@ -609,7 +611,11 @@ impl Workspace {
                 eprintln!("broom: keep mine: {err}");
             }
         }
+        if let Some(editor) = self.center.clone() {
+            editor.update(cx, |ed, _| ed.mark_dirty());
+        }
         self.safety.note_edit(Some(&path));
+        self.refresh_status(cx);
         true
     }
 
