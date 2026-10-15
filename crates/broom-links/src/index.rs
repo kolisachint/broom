@@ -6,17 +6,26 @@
 //!
 //! Resolution of a target string to a file:
 //! 1. Exact relative path match, with or without `.md` (e.g. `notes/ideas`).
-//! 2. Otherwise, file stem match, case-insensitive (e.g. `ideas`).
-//!    If several files share the stem, the shortest path wins, then sorted order.
+//! 2. Otherwise, a path that ends in `/target`, case-insensitive. A bare name
+//!    (e.g. `ideas`) matches any file with that stem, in any folder.
+//!    If several files match, an exact match wins, then the fewest folders,
+//!    then sorted path order.
 //!
 //! An unresolved target is valid. It is shown as a "missing" link.
+//!
+//! Relative paths passed to methods are relative to [`LinkIndex::root`].
+//! [`LinkIndex::build`] canonicalizes the root, so absolute paths under it
+//! (with or without symlinks in the path) refer to the same entry.
 
-use crate::wikilink::{WikiLinkSpan, find_wikilinks, normalize_path, strip_md, target_key};
+use crate::wikilink::{
+    WikiLinkSpan, find_wikilinks, normalize_path, strip_md, target_key, target_part,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Most completion candidates returned by [`LinkIndex::completions`].
 const MAX_COMPLETIONS: usize = 50;
@@ -26,7 +35,8 @@ const MAX_COMPLETIONS: usize = 50;
 pub struct Backlink {
     /// The file that contains the link.
     pub source: PathBuf,
-    /// Byte range of the link in that file's contents.
+    /// Byte range (not char indexes) of the link in that file's contents.
+    /// Same as [`WikiLinkSpan::span`] of the stored link.
     pub span: Range<usize>,
     /// Alias text, if the link has one.
     pub alias: Option<String>,
@@ -44,19 +54,61 @@ pub struct Completion {
 #[derive(Debug, Default)]
 pub struct LinkIndex {
     root: PathBuf,
-    // file -> links found in its contents at last update
-    files: BTreeMap<PathBuf, Vec<WikiLinkSpan>>,
+    // file key (see `file_key`) -> the file and its links at last update
+    files: BTreeMap<String, Entry>,
+    // Resolution table, built on first use. Cleared by update and remove.
+    resolver: OnceLock<Resolver>,
+}
+
+/// One indexed file.
+#[derive(Debug)]
+struct Entry {
+    /// Absolute path as stored.
+    path: PathBuf,
+    /// Normalized key used for resolution (see `normalize_path`).
+    norm: String,
+    /// File stem, original case.
+    stem: String,
+    /// `stem` lowercased. Computed once for completions.
+    stem_lc: String,
+    /// Path under the root without `.md`, original case. `None` outside the root.
+    display: Option<String>,
+    /// `display` lowercased.
+    display_lc: Option<String>,
+    links: Vec<WikiLinkSpan>,
+}
+
+impl Entry {
+    fn new(path: PathBuf, root: &Path, links: Vec<WikiLinkSpan>) -> Entry {
+        let norm = norm_key(&file_key(&path, root));
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let display = rel_display(&path, root);
+        Entry {
+            norm,
+            stem_lc: stem.to_lowercase(),
+            stem,
+            display_lc: display.as_ref().map(|d| d.to_lowercase()),
+            display,
+            path,
+            links,
+        }
+    }
 }
 
 impl LinkIndex {
     /// Walks `root` for markdown files and indexes every link in each one.
-    /// Unreadable files are skipped, not fatal.
+    /// Unreadable files are skipped, not fatal. `root` is canonicalized, so
+    /// [`LinkIndex::root`] returns an absolute path.
     pub fn build(root: &Path) -> io::Result<LinkIndex> {
+        let root = fs::canonicalize(root)?;
         let mut paths = Vec::new();
-        walk_dir(root, &mut paths)?;
+        walk_dir(&root, &mut paths)?;
         let mut index = LinkIndex {
-            root: root.to_path_buf(),
-            files: BTreeMap::new(),
+            root,
+            ..LinkIndex::default()
         };
         for path in paths {
             if let Ok(contents) = fs::read_to_string(&path) {
@@ -73,19 +125,23 @@ impl LinkIndex {
 
     /// Re-parses one file from `contents` (no disk read). Adds the file if new.
     pub fn update_file(&mut self, path: &Path, contents: &str) {
-        self.files
-            .insert(path.to_path_buf(), find_wikilinks(contents));
+        let path = self.absolute(path);
+        let key = file_key(&path, &self.root);
+        let links = find_wikilinks(contents);
+        self.resolver.take();
+        self.files.insert(key, Entry::new(path, &self.root, links));
     }
 
     /// Drops a file from the index (deleted or moved out of the folder).
     pub fn remove_file(&mut self, path: &Path) {
-        self.files.remove(path);
+        let key = file_key(&self.absolute(path), &self.root);
+        self.resolver.take();
+        self.files.remove(&key);
     }
 
     /// The file `target` resolves to, if any. See the module docs for the rule.
     pub fn resolve(&self, target: &str) -> Option<&Path> {
-        let resolver = Resolver::new(&self.root, self.files.keys().map(PathBuf::as_path));
-        resolver.resolve_key(&target_key(target))
+        self.resolver().resolve_key(&target_key(target))
     }
 
     /// Every link whose target resolves to the same file as `target`.
@@ -98,26 +154,36 @@ impl LinkIndex {
         if key.is_empty() {
             return Vec::new();
         }
-        let resolver = Resolver::new(&self.root, self.files.keys().map(PathBuf::as_path));
+        let resolver = self.resolver();
         let resolved = resolver.resolve_key(&key);
-        let mut out = Vec::new();
-        for (source, links) in &self.files {
-            for link in links {
+        // Each distinct link target is resolved once.
+        let mut memo: HashMap<String, Option<&Path>> = HashMap::new();
+        let mut found: Vec<(&Entry, &WikiLinkSpan)> = Vec::new();
+        for entry in self.files.values() {
+            for link in &entry.links {
                 let link_key = target_key(&link.link.target);
+                let to = *memo
+                    .entry(link_key.clone())
+                    .or_insert_with(|| resolver.resolve_key(&link_key));
                 let hit = match resolved {
-                    Some(path) => resolver.resolve_key(&link_key) == Some(path),
-                    None => link_key == key && resolver.resolve_key(&link_key).is_none(),
+                    Some(path) => to == Some(path),
+                    None => to.is_none() && link_key == key,
                 };
                 if hit {
-                    out.push(Backlink {
-                        source: source.clone(),
-                        span: link.span.clone(),
-                        alias: link.link.alias.clone(),
-                    });
+                    found.push((entry, link));
                 }
             }
         }
-        out
+        // Stable sort: spans within one file keep their order.
+        found.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+        found
+            .into_iter()
+            .map(|(entry, link)| Backlink {
+                source: entry.path.clone(),
+                span: link.span.clone(),
+                alias: link.link.alias.clone(),
+            })
+            .collect()
     }
 
     /// Autocomplete candidates for `[[prefix`. Case-insensitive prefix match
@@ -129,19 +195,15 @@ impl LinkIndex {
     pub fn completions(&self, prefix: &str) -> Vec<Completion> {
         let prefix = prefix.trim().to_lowercase();
         let by_path = prefix.contains('/');
-        // (rank, sort key, candidate)
-        let mut hits: Vec<(u8, String, Completion)> = Vec::new();
-        for path in self.files.keys() {
-            let display = match rel_display(path, &self.root) {
-                Some(d) => d,
-                None => continue,
-            };
-            let stem = display.rsplit('/').next().unwrap_or("").to_string();
+        // (rank: 0 = prefix, 1 = substring; entry)
+        let mut hits: Vec<(u8, &Entry)> = Vec::new();
+        for entry in self.files.values() {
             let hay = if by_path {
-                display.to_lowercase()
+                entry.display_lc.as_deref()
             } else {
-                stem.to_lowercase()
+                Some(entry.stem_lc.as_str())
             };
+            let Some(hay) = hay else { continue };
             let rank = if hay.starts_with(&prefix) {
                 0
             } else if hay.contains(&prefix) {
@@ -149,20 +211,26 @@ impl LinkIndex {
             } else {
                 continue;
             };
-            let target = if by_path { display } else { stem.clone() };
-            hits.push((
-                rank,
-                stem.to_lowercase(),
-                Completion {
-                    target,
-                    path: path.clone(),
-                },
-            ));
+            hits.push((rank, entry));
         }
-        hits.sort_by(|a, b| (a.0, &a.1, &a.2.path).cmp(&(b.0, &b.1, &b.2.path)));
+        let order = |a: &(u8, &Entry), b: &(u8, &Entry)| {
+            (a.0, &a.1.stem_lc, &a.1.path).cmp(&(b.0, &b.1.stem_lc, &b.1.path))
+        };
+        // Keep only the best MAX_COMPLETIONS, then sort those.
+        if hits.len() > MAX_COMPLETIONS {
+            hits.select_nth_unstable_by(MAX_COMPLETIONS - 1, order);
+            hits.truncate(MAX_COMPLETIONS);
+        }
+        hits.sort_by(order);
         hits.into_iter()
-            .take(MAX_COMPLETIONS)
-            .map(|(_, _, c)| c)
+            .map(|(_, entry)| Completion {
+                target: if by_path {
+                    entry.display.clone().unwrap_or_default()
+                } else {
+                    entry.stem.clone()
+                },
+                path: entry.path.clone(),
+            })
             .collect()
     }
 
@@ -172,48 +240,78 @@ impl LinkIndex {
     /// - Reads each linking file from disk. Save open dirty buffers first.
     /// - `[[old]]` becomes `[[new_stem]]`. Aliases are kept:
     ///   `[[old|Shown]]` becomes `[[new_stem|Shown]]`.
+    /// - A bare name is used only when it still resolves to `new` after the
+    ///   rename. Otherwise, or when the link is path-qualified, the new path
+    ///   is used (`[[archive/new]]`).
+    /// - A file that is `old` itself is returned under the path `new`.
     /// - Files with no matching links are not returned.
+    /// - Files that cannot be read as UTF-8 text are skipped, not fatal. They
+    ///   are not rewritten, even if they link to `old`.
     /// - Does not touch `old` or `new` on disk. The caller renames the file.
+    /// - `new_stem` and the new path are rejected with `InvalidInput` when they
+    ///   cannot be written in `[[...]]`: `|`, `#`, `[`, `]`, `\`, line breaks,
+    ///   or leading or trailing spaces.
     pub fn rename_rewrite(&self, old: &Path, new: &Path) -> io::Result<Vec<(PathBuf, String)>> {
-        if old == new {
+        let old = self.absolute(old);
+        let new = self.absolute(new);
+        let old_key = file_key(&old, &self.root);
+        let new_key = file_key(&new, &self.root);
+        if old_key == new_key {
             return Ok(Vec::new());
         }
         let new_stem = match new.file_stem().and_then(|s| s.to_str()) {
             Some(stem) if !stem.is_empty() => stem.to_string(),
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad new name")),
+            _ => return Err(invalid_name("")),
         };
-        let new_display = rel_display(new, &self.root);
+        check_link_name(&new_stem)?;
+        let new_display = rel_display(&new, &self.root);
+        if let Some(display) = &new_display {
+            check_link_name(display)?;
+        }
 
-        // Resolve as the links were before the rename: `old` present, `new` absent.
-        let resolver = Resolver::new(
-            &self.root,
+        // Resolution before the rename (`old` present, `new` absent) decides
+        // which links point at `old`. Resolution after the rename decides
+        // whether a bare name still reaches `new`.
+        let others = || {
             self.files
-                .keys()
-                .map(PathBuf::as_path)
-                .filter(|p| *p != new && *p != old)
-                .chain(std::iter::once(old)),
-        );
+                .iter()
+                .filter(|(k, _)| k.as_str() != old_key.as_str() && k.as_str() != new_key.as_str())
+                .map(|(_, e)| (e.path.clone(), e.norm.clone()))
+        };
+        let before = Resolver::new(others().chain([(old.clone(), norm_key(&old_key))]));
+        let after = Resolver::new(others().chain([(new.clone(), norm_key(&new_key))]));
+        let bare_ok = after.resolve_key(&target_key(&new_stem)) == Some(new.as_path());
 
         let mut out = Vec::new();
-        for path in self.files.keys() {
-            let text = match fs::read_to_string(path) {
-                Ok(text) => text,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
+        for (key, entry) in &self.files {
+            let is_old = key.as_str() == old_key.as_str();
+            let read = fs::read_to_string(&entry.path);
+            let read = if is_old && read.is_err() {
+                // The caller may already have renamed the file.
+                fs::read_to_string(&new)
+            } else {
+                read
+            };
+            let Ok(text) = read else { continue };
+            let out_path = if is_old {
+                new.clone()
+            } else {
+                entry.path.clone()
             };
             let mut buf = String::new();
             let mut cursor = 0;
             for link in find_wikilinks(&text) {
-                if resolver.resolve_key(&target_key(&link.link.target)) != Some(old) {
+                if before.resolve_key(&target_key(&link.link.target)) != Some(old.as_path()) {
                     continue;
                 }
                 let name = name_range(&text, &link.span);
                 let raw = &text[name.clone()];
-                let qualified = raw.contains('/') || raw.contains('\\');
-                let mut replacement = match (&new_display, qualified) {
-                    (Some(display), true) => display.clone(),
-                    _ => new_stem.clone(),
+                let qualified = raw.contains(['/', '\\']);
+                let base = match &new_display {
+                    Some(display) if qualified || !bare_ok => display.as_str(),
+                    _ => new_stem.as_str(),
                 };
+                let mut replacement = base.to_string();
                 if strip_md(raw).len() != raw.len() {
                     replacement.push_str(".md");
                 }
@@ -223,18 +321,74 @@ impl LinkIndex {
             }
             if cursor > 0 {
                 buf.push_str(&text[cursor..]);
-                out.push((path.clone(), buf));
+                out.push((out_path, buf));
             }
         }
         Ok(out)
     }
+
+    /// The resolution table, built on first use.
+    fn resolver(&self) -> &Resolver {
+        self.resolver.get_or_init(|| {
+            Resolver::new(
+                self.files
+                    .values()
+                    .map(|e| (e.path.clone(), e.norm.clone())),
+            )
+        })
+    }
+
+    /// Absolute form of `path`. Relative paths are taken from the root. The
+    /// nearest existing ancestor folder is canonicalized, so `/var/...` and
+    /// `/private/var/...` give the same key. Folders that do not exist yet
+    /// (a rename target) keep their written names.
+    fn absolute(&self, path: &Path) -> PathBuf {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        let Some(name) = abs.file_name() else {
+            return abs;
+        };
+        // Names below the canonical ancestor, deepest first.
+        let mut tail = vec![name];
+        let mut dir = abs.parent();
+        while let Some(d) = dir {
+            if let Ok(canon) = fs::canonicalize(d) {
+                return tail.iter().rev().fold(canon, |acc, p| acc.join(p));
+            }
+            match d.file_name() {
+                Some(n) => tail.push(n),
+                None => return abs,
+            }
+            dir = d.parent();
+        }
+        abs
+    }
 }
 
-/// Byte range of the note name inside a link span: trimmed, before any `#` or `|`.
+/// Rejects names that cannot be written inside `[[...]]` and read back.
+fn check_link_name(name: &str) -> io::Result<()> {
+    let bad = name.is_empty()
+        || name.trim() != name
+        || name.contains(['|', '#', '[', ']', '\\', '\n', '\r']);
+    if bad { Err(invalid_name(name)) } else { Ok(()) }
+}
+
+fn invalid_name(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("name cannot be used in a wikilink: {name:?}"),
+    )
+}
+
+/// Byte range of the note name inside a link span: trimmed, before any `#`
+/// or `|` (and before a table `\|`).
 fn name_range(text: &str, span: &Range<usize>) -> Range<usize> {
     let inner_start = span.start + 2;
     let inner = &text[inner_start..span.end - 2];
-    let target = inner.split_once('|').map_or(inner, |(t, _)| t);
+    let target = target_part(inner);
     let before_hash = target.split_once('#').map_or(target, |(n, _)| n);
     let lead = before_hash.len() - before_hash.trim_start().len();
     let name = before_hash.trim();
@@ -242,21 +396,16 @@ fn name_range(text: &str, span: &Range<usize>) -> Range<usize> {
     start..start + name.len()
 }
 
-/// Recursively collects `*.md` files under `dir`. Skips hidden directories
-/// (names starting with `.`) and symlinked directories. Errors below the
-/// top level are skipped.
+/// Recursively collects markdown files under `dir`. Skips `.git` and
+/// symlinked directories. Errors below the top level are skipped.
 fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
-    let entries = fs::read_dir(dir)?;
-    for entry in entries.flatten() {
+    for entry in fs::read_dir(dir)?.flatten() {
         let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
+        let Ok(file_type) = entry.file_type() else {
+            continue;
         };
         if file_type.is_dir() {
-            if !name.starts_with('.') {
+            if entry.file_name().to_string_lossy() != ".git" {
                 let _ = walk_dir(&path, out);
             }
         } else if file_type.is_file() && is_markdown(&path) {
@@ -266,71 +415,84 @@ fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+/// `.md` or `.markdown`, any case.
 fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
 }
 
-/// Path under `root` as `a/b/c.md` with the original case. Components only.
-/// `None` when `path` is not under `root`.
+/// Drops a trailing `.md` or `.markdown` (any case).
+fn strip_note_ext(s: &str) -> &str {
+    let n = s.len();
+    if n >= 9 && s.as_bytes()[n - 9..].eq_ignore_ascii_case(b".markdown") {
+        return s.get(..n - 9).unwrap_or(s);
+    }
+    strip_md(s)
+}
+
+/// Path components under `root`, joined with `/`, original case, extension
+/// kept. `None` when `path` is not under `root` or is `root` itself.
 fn rel_components(path: &Path, root: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
-    let parts: Vec<String> = rel
-        .components()
+    let s = components_of(rel);
+    (!s.is_empty()).then_some(s)
+}
+
+/// Relative path without the note extension, original case.
+/// `None` when `path` is outside `root`.
+fn rel_display(path: &Path, root: &Path) -> Option<String> {
+    rel_components(path, root).map(|s| strip_note_ext(&s).to_string())
+}
+
+/// Identity of a file in the index: its path under `root`, original case,
+/// joined with `/`. Outside `root`, the path's own components.
+fn file_key(path: &Path, root: &Path) -> String {
+    rel_components(path, root).unwrap_or_else(|| components_of(path))
+}
+
+/// Normalized lookup key of a file key (lowercase, no note extension).
+fn norm_key(key: &str) -> String {
+    normalize_path(strip_note_ext(key))
+}
+
+/// Normal components of `path` joined with `/`. Root and prefix parts are dropped.
+fn components_of(path: &Path) -> String {
+    path.components()
         .filter_map(|c| match c {
             Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
             _ => None,
         })
-        .collect();
-    (!parts.is_empty()).then(|| parts.join("/"))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
-/// Relative path without `.md`, original case. Used for display and for
-/// path-qualified completions. `None` when `path` is outside `root`.
-fn rel_display(path: &Path, root: &Path) -> Option<String> {
-    rel_components(path, root).map(|s| strip_md(&s).to_string())
-}
-
-/// Lookup key of a file: normalized relative path. Falls back to the path's
-/// own components when it is outside `root`.
-fn file_key(path: &Path, root: &Path) -> String {
-    let text = rel_components(path, root).unwrap_or_else(|| {
-        path.components()
-            .filter_map(|c| match c {
-                Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/")
-    });
-    normalize_path(&text)
-}
-
-/// Resolves target keys to files. Built once per query.
-struct Resolver<'a> {
-    // (path, normalized relative key), in the order given
-    entries: Vec<(&'a Path, String)>,
-    // last path segment of the key -> indexes into `entries`
+/// Resolves normalized target keys to files. Entries are sorted by path, so
+/// ties go to the first path in sorted order.
+#[derive(Debug)]
+struct Resolver {
+    // (path, normalized key), sorted by path
+    entries: Vec<(PathBuf, String)>,
+    // last segment of the key -> indexes into `entries`
     by_stem: HashMap<String, Vec<usize>>,
 }
 
-impl<'a> Resolver<'a> {
-    fn new(root: &Path, paths: impl IntoIterator<Item = &'a Path>) -> Self {
-        let mut entries = Vec::new();
+impl Resolver {
+    fn new(items: impl IntoIterator<Item = (PathBuf, String)>) -> Resolver {
+        let mut entries: Vec<(PathBuf, String)> = items.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
         let mut by_stem: HashMap<String, Vec<usize>> = HashMap::new();
-        for path in paths {
-            let key = file_key(path, root);
+        for (i, (_, key)) in entries.iter().enumerate() {
             let stem = key.rsplit('/').next().unwrap_or("").to_string();
-            by_stem.entry(stem).or_default().push(entries.len());
-            entries.push((path, key));
+            by_stem.entry(stem).or_default().push(i);
         }
         Resolver { entries, by_stem }
     }
 
-    /// `key` is a normalized target (see [`target_key`]). Exact path match
-    /// first, then a path ending in `/key`. Ties: fewer folders, then order.
-    fn resolve_key(&self, key: &str) -> Option<&'a Path> {
+    /// `key` is a normalized target (see [`target_key`]). Matches a file whose
+    /// key equals `key` or ends in `/key`. Exact match first, then fewest
+    /// folders, then sorted order.
+    fn resolve_key(&self, key: &str) -> Option<&Path> {
         if key.is_empty() {
             return None;
         }
@@ -341,405 +503,9 @@ impl<'a> Resolver<'a> {
             .map(|&i| &self.entries[i])
             .filter(|(_, k)| k == key || k.ends_with(&suffix))
             .min_by_key(|(_, k)| (k != key, k.matches('/').count()))
-            .map(|(path, _)| *path)
+            .map(|(path, _)| path.as_path())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    /// Writes `rel` under `root`, creating folders. Returns the full path.
-    fn write(root: &Path, rel: &str, contents: &str) -> PathBuf {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, contents).unwrap();
-        path
-    }
-
-    fn folder() -> TempDir {
-        tempfile::tempdir().unwrap()
-    }
-
-    #[test]
-    fn build_walks_nested_markdown_only() {
-        let dir = folder();
-        let root = dir.path();
-        let a = write(root, "a.md", "[[b]]");
-        let sub = write(root, "sub/deep/c.MD", "[[a]]");
-        write(root, "notes.txt", "[[a]]");
-        write(root, ".git/x.md", "[[a]]");
-        write(root, ".hidden/y.md", "[[a]]");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.root(), root);
-        let keys: Vec<&PathBuf> = index.files.keys().collect();
-        assert_eq!(keys.len(), 2);
-        assert!(index.files.contains_key(&a));
-        assert!(index.files.contains_key(&sub));
-        assert_eq!(index.files[&a].len(), 1);
-    }
-
-    #[test]
-    fn build_missing_root_is_error() {
-        let dir = folder();
-        assert!(LinkIndex::build(&dir.path().join("nope")).is_err());
-    }
-
-    #[test]
-    fn build_empty_folder() {
-        let dir = folder();
-        let index = LinkIndex::build(dir.path()).unwrap();
-        assert!(index.files.is_empty());
-        assert!(index.backlinks("x").is_empty());
-    }
-
-    #[test]
-    fn update_and_remove_keep_links_current() {
-        let dir = folder();
-        let root = dir.path();
-        let a = write(root, "a.md", "[[b]]");
-        write(root, "b.md", "");
-        let mut index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.backlinks("b").len(), 1);
-
-        index.update_file(&a, "no links now");
-        assert!(index.backlinks("b").is_empty());
-
-        index.update_file(&root.join("new.md"), "[[b|B]]");
-        assert_eq!(index.backlinks("b").len(), 1);
-
-        index.remove_file(&root.join("new.md"));
-        assert!(index.backlinks("b").is_empty());
-    }
-
-    #[test]
-    fn resolve_exact_path_with_or_without_md() {
-        let dir = folder();
-        let root = dir.path();
-        let ideas = write(root, "notes/ideas.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.resolve("notes/ideas"), Some(ideas.as_path()));
-        assert_eq!(index.resolve("notes/ideas.md"), Some(ideas.as_path()));
-        assert_eq!(index.resolve("Notes/Ideas"), Some(ideas.as_path()));
-    }
-
-    #[test]
-    fn resolve_stem_is_case_insensitive() {
-        let dir = folder();
-        let root = dir.path();
-        let ideas = write(root, "notes/Ideas.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.resolve("ideas"), Some(ideas.as_path()));
-        assert_eq!(index.resolve("IDEAS"), Some(ideas.as_path()));
-        assert_eq!(index.resolve("ideas#Plan"), Some(ideas.as_path()));
-    }
-
-    #[test]
-    fn resolve_unknown_and_empty_are_none() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "a.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.resolve("missing"), None);
-        assert_eq!(index.resolve(""), None);
-        assert_eq!(index.resolve("a/b"), None);
-        assert_eq!(index.resolve("a-b"), None);
-    }
-
-    #[test]
-    fn resolve_prefers_root_level_over_nested_stem() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "deep/er/ideas.md", "");
-        let top = write(root, "ideas.md", "");
-        write(root, "zz/ideas.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.resolve("ideas"), Some(top.as_path()));
-    }
-
-    #[test]
-    fn resolve_same_depth_uses_sorted_order() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "b/dup.md", "");
-        let a = write(root, "a/dup.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.resolve("dup"), Some(a.as_path()));
-    }
-
-    #[test]
-    fn resolve_path_qualified_picks_matching_folder() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "work/ideas.md", "");
-        let home = write(root, "home/ideas.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.resolve("home/ideas"), Some(home.as_path()));
-        assert_eq!(index.resolve("Home/Ideas.md"), Some(home.as_path()));
-    }
-
-    #[test]
-    fn resolve_path_qualified_prefers_exact_over_suffix() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "x/notes/ideas.md", "");
-        let exact = write(root, "notes/ideas.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.resolve("notes/ideas"), Some(exact.as_path()));
-    }
-
-    #[test]
-    fn backlinks_sorted_by_source_then_offset() {
-        let dir = folder();
-        let root = dir.path();
-        let target = write(root, "target.md", "");
-        let z = write(root, "z.md", "[[target]] then [[Target|T]]");
-        let a = write(root, "a.md", "x\n[[target#Part]]");
-        let index = LinkIndex::build(root).unwrap();
-        let links = index.backlinks("target");
-        assert_eq!(links.len(), 3);
-        assert_eq!(links[0].source, a);
-        assert_eq!(links[1].source, z);
-        assert_eq!(links[2].source, z);
-        assert!(links[1].span.start < links[2].span.start);
-        assert_eq!(links[0].alias, None);
-        assert_eq!(links[2].alias.as_deref(), Some("T"));
-        assert_eq!(&index.files[&z][0].span, &links[1].span);
-        assert_eq!(index.resolve("target"), Some(target.as_path()));
-    }
-
-    #[test]
-    fn backlinks_accept_any_spelling_of_the_target() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "notes/ideas.md", "");
-        write(root, "src.md", "[[Notes/Ideas]] [[ideas.md]]");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.backlinks("ideas").len(), 2);
-        assert_eq!(index.backlinks("notes/ideas.md").len(), 2);
-        assert_eq!(index.backlinks("IDEAS#Plan").len(), 2);
-    }
-
-    #[test]
-    fn backlinks_follow_the_same_resolution_as_resolve() {
-        let dir = folder();
-        let root = dir.path();
-        let work = write(root, "work/ideas.md", "");
-        write(root, "home/ideas.md", "");
-        write(root, "src.md", "[[work/ideas]] [[ideas]] [[home/ideas]]");
-        let index = LinkIndex::build(root).unwrap();
-        // "ideas" ties on depth and goes to the first sorted path: home/ideas.md
-        let to_work = index.backlinks("work/ideas");
-        assert_eq!(to_work.len(), 1);
-        assert_eq!(to_work[0].span, 0..14);
-        assert_eq!(index.resolve("ideas"), index.resolve("home/ideas"));
-        assert_eq!(index.backlinks("home/ideas").len(), 2);
-        assert_eq!(index.resolve("work/ideas"), Some(work.as_path()));
-    }
-
-    #[test]
-    fn backlinks_to_missing_note_match_same_key() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "src.md", "[[ghost]] [[Ghost|G]] [[other]]");
-        let index = LinkIndex::build(root).unwrap();
-        assert_eq!(index.backlinks("ghost").len(), 2);
-        assert!(index.backlinks("nothing").is_empty());
-        assert!(index.backlinks("").is_empty());
-    }
-
-    #[test]
-    fn completions_prefix_ranks_before_substring() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "my-ideas.md", "");
-        write(root, "ideas-2.md", "");
-        write(root, "IDEAS.md", "");
-        write(root, "zeta.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        let got: Vec<String> = index
-            .completions("ide")
-            .into_iter()
-            .map(|c| c.target)
-            .collect();
-        assert_eq!(got, vec!["IDEAS", "ideas-2", "my-ideas"]);
-    }
-
-    #[test]
-    fn completions_are_case_insensitive_and_sorted_by_stem_then_path() {
-        let dir = folder();
-        let root = dir.path();
-        let b = write(root, "b/Plan.md", "");
-        let a = write(root, "a/plan.md", "");
-        write(root, "other.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        let got = index.completions("PLA");
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].path, a);
-        assert_eq!(got[1].path, b);
-        assert_eq!(got[0].target, "plan");
-    }
-
-    #[test]
-    fn completions_empty_prefix_lists_all_capped_at_50() {
-        let dir = folder();
-        let root = dir.path();
-        for i in 0..60 {
-            write(root, &format!("n{i:02}.md"), "");
-        }
-        let index = LinkIndex::build(root).unwrap();
-        let got = index.completions("");
-        assert_eq!(got.len(), 50);
-        assert_eq!(got[0].target, "n00");
-        assert_eq!(index.completions("  ").len(), 50);
-    }
-
-    #[test]
-    fn completions_cap_keeps_best_ranked() {
-        let dir = folder();
-        let root = dir.path();
-        for i in 0..55 {
-            write(root, &format!("x-note{i:02}.md"), "");
-        }
-        write(root, "note.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        let got = index.completions("note");
-        assert_eq!(got.len(), 50);
-        assert_eq!(got[0].target, "note");
-        assert_eq!(index.completions("x-note").len(), 50);
-        assert_eq!(index.completions("x-note")[0].target, "x-note00");
-    }
-
-    #[test]
-    fn completions_path_prefix_uses_folder_and_returns_path() {
-        let dir = folder();
-        let root = dir.path();
-        write(root, "work/ideas.md", "");
-        write(root, "home/ideas.md", "");
-        let index = LinkIndex::build(root).unwrap();
-        let got: Vec<String> = index
-            .completions("work/")
-            .into_iter()
-            .map(|c| c.target)
-            .collect();
-        assert_eq!(got, vec!["work/ideas"]);
-        assert!(index.completions("nothing").is_empty());
-    }
-
-    #[test]
-    fn rename_rewrites_plain_alias_and_heading() {
-        let dir = folder();
-        let root = dir.path();
-        let old = write(root, "old.md", "");
-        let new = root.join("fresh.md");
-        let src = write(
-            root,
-            "src.md",
-            "[[old]] [[old|Shown]] [[Old#Part]] [[old#Part|A]] [[old.md]]",
-        );
-        let index = LinkIndex::build(root).unwrap();
-        let out = index.rename_rewrite(&old, &new).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, src);
-        assert_eq!(
-            out[0].1,
-            "[[fresh]] [[fresh|Shown]] [[fresh#Part]] [[fresh#Part|A]] [[fresh.md]]"
-        );
-    }
-
-    #[test]
-    fn rename_keeps_spacing_inside_brackets() {
-        let dir = folder();
-        let root = dir.path();
-        let old = write(root, "old.md", "");
-        let new = root.join("fresh.md");
-        write(root, "src.md", "[[ old  |  Shown ]]");
-        let index = LinkIndex::build(root).unwrap();
-        let out = index.rename_rewrite(&old, &new).unwrap();
-        assert_eq!(out[0].1, "[[ fresh  |  Shown ]]");
-    }
-
-    #[test]
-    fn rename_path_qualified_link_gets_new_path() {
-        let dir = folder();
-        let root = dir.path();
-        let old = write(root, "notes/old.md", "");
-        let new = root.join("archive/new.md");
-        write(
-            root,
-            "src.md",
-            "[[notes/old]] and [[old]] and [[notes/old|X]]",
-        );
-        let index = LinkIndex::build(root).unwrap();
-        let out = index.rename_rewrite(&old, &new).unwrap();
-        assert_eq!(
-            out[0].1,
-            "[[archive/new]] and [[new]] and [[archive/new|X]]"
-        );
-    }
-
-    #[test]
-    fn rename_leaves_code_unrelated_and_other_files_alone() {
-        let dir = folder();
-        let root = dir.path();
-        let old = write(root, "old.md", "");
-        let new = root.join("fresh.md");
-        write(root, "code.md", "`[[old]]`\n```\n[[old]]\n```\n[[other]]");
-        write(root, "unrelated.md", "[[oldish]] [[other]]");
-        write(root, "plain.md", "no links");
-        let index = LinkIndex::build(root).unwrap();
-        assert!(index.rename_rewrite(&old, &new).unwrap().is_empty());
-    }
-
-    #[test]
-    fn rename_skips_links_that_resolve_elsewhere() {
-        let dir = folder();
-        let root = dir.path();
-        let old = write(root, "sub/old.md", "");
-        write(root, "old.md", "");
-        let new = root.join("sub/fresh.md");
-        write(root, "src.md", "[[old]] [[sub/old]]");
-        let index = LinkIndex::build(root).unwrap();
-        let out = index.rename_rewrite(&old, &new).unwrap();
-        assert_eq!(out[0].1, "[[old]] [[sub/fresh]]");
-    }
-
-    #[test]
-    fn rename_reads_disk_not_index_and_writes_nothing() {
-        let dir = folder();
-        let root = dir.path();
-        let old = write(root, "old.md", "");
-        let src = write(root, "src.md", "[[old]]");
-        let mut index = LinkIndex::build(root).unwrap();
-        // Index is stale: the disk has the link, the index does not.
-        index.update_file(&src, "nothing");
-        let out = index.rename_rewrite(&old, &root.join("new.md")).unwrap();
-        assert_eq!(out[0].1, "[[new]]");
-        assert_eq!(fs::read_to_string(&src).unwrap(), "[[old]]");
-        assert!(old.exists());
-    }
-
-    #[test]
-    fn rename_works_after_caller_removed_old_from_index() {
-        let dir = folder();
-        let root = dir.path();
-        let old = write(root, "old.md", "");
-        write(root, "src.md", "[[old]]");
-        let mut index = LinkIndex::build(root).unwrap();
-        index.remove_file(&old);
-        let out = index.rename_rewrite(&old, &root.join("new.md")).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].1, "[[new]]");
-    }
-
-    #[test]
-    fn rename_same_name_is_noop() {
-        let dir = folder();
-        let root = dir.path();
-        let old = write(root, "old.md", "");
-        write(root, "src.md", "[[old]]");
-        let index = LinkIndex::build(root).unwrap();
-        assert!(index.rename_rewrite(&old, &old).unwrap().is_empty());
-    }
-}
+mod tests;
