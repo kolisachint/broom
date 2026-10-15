@@ -10,15 +10,20 @@
 //! Modes: [`Mode::Normal`], [`Mode::Insert`], [`Mode::Visual`], [`Mode::VisualLine`].
 //! Labels for the status bar: `NORMAL`, `INSERT`, `VISUAL`, `V-LINE`.
 //!
-//! Insert mode: printable keys, Enter, Backspace, Tab return
+//! Insert mode: plain printable keys, Enter, Backspace, Tab return
 //! [`VimOutcome::PassThrough`]. The editor then types them with
-//! `Document::insert_typed`, so input rules still run.
-
-#![allow(unused_variables, dead_code)] // scaffold: remove as stubs are implemented
+//! `Document::insert_typed`, so input rules still run. Ctrl/Alt chords,
+//! arrows, Home/End and Delete return [`VimOutcome::EditorKey`]: the editor
+//! applies them as plain editing keys (they are never typed as text).
 
 pub mod buffer;
 pub mod key;
 pub mod machine;
+#[cfg(test)]
+mod mock;
+pub mod motion;
+pub mod register;
+pub mod textobj;
 
 pub use broom_config::Command;
 pub use buffer::{Cursor, Selection, TextRange, VimBuffer};
