@@ -237,12 +237,12 @@ fn slot_runs(kind: &BlockKind, k: usize) -> Option<Vec<Run>> {
     }
 }
 
-/// `*x*`, `**x**`, `_x_`, `~~x~~`, or `` `x` `` closed by the last typed char.
+/// `*x*`, `**x**`, `~~x~~`, or `` `x` `` closed by the last typed char.
+/// Underscore is not a rule: `_` appears in URLs and identifiers.
 fn inline_rule(chars: &[char], plain: &[bool], l: usize, k: usize) -> Option<InlineRule> {
     let last = chars[l - 1];
     let options: &[(&str, StyleFlag)] = match last {
         '*' => &[("**", StyleFlag::Bold), ("*", StyleFlag::Italic)],
-        '_' => &[("_", StyleFlag::Italic)],
         '~' => &[("~~", StyleFlag::Strike)],
         '`' => &[("`", StyleFlag::Code)],
         _ => return None,
@@ -265,14 +265,6 @@ fn inline_rule(chars: &[char], plain: &[bool], l: usize, k: usize) -> Option<Inl
             }
             if chars[open + d].is_whitespace() || chars[l - d - 1].is_whitespace() {
                 continue;
-            }
-            if last == '_' {
-                if open > 0 && chars[open - 1].is_alphanumeric() {
-                    continue;
-                }
-                if chars.get(l).is_some_and(|ch| ch.is_alphanumeric()) {
-                    return None;
-                }
             }
             if last == '*' && d == 1 && open > 0 && chars[open - 1] == '*' {
                 continue;
@@ -533,7 +525,6 @@ mod tests {
         let cases = [
             ("**x**", StyleFlag::Bold, "x"),
             ("*x*", StyleFlag::Italic, "x"),
-            ("_x_", StyleFlag::Italic, "x"),
             ("`x`", StyleFlag::Code, "x"),
             ("~~x~~", StyleFlag::Strike, "x"),
         ];
@@ -558,6 +549,13 @@ mod tests {
         let mut doc = Document::empty();
         type_into(&mut doc, 0, "snake_case_");
         assert_eq!(doc.visible_text(0).unwrap(), "snake_case_");
+
+        for text in ["http://x.com/_a_b", "_private_var", "a_b", "_c_d"] {
+            let mut doc = Document::empty();
+            type_into(&mut doc, 0, text);
+            assert_eq!(doc.visible_text(0).unwrap(), text);
+            assert_eq!(Document::parse(&doc.to_markdown()).visible_text(0).unwrap(), text);
+        }
     }
 
     #[test]
