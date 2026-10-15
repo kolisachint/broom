@@ -159,9 +159,7 @@ impl LinkIndex {
                 },
             ));
         }
-        hits.sort_by(|a, b| {
-            (a.0, &a.1, &a.2.path).cmp(&(b.0, &b.1, &b.2.path))
-        });
+        hits.sort_by(|a, b| (a.0, &a.1, &a.2.path).cmp(&(b.0, &b.1, &b.2.path)));
         hits.into_iter()
             .take(MAX_COMPLETIONS)
             .map(|(_, _, c)| c)
@@ -549,5 +547,199 @@ mod tests {
         assert_eq!(index.backlinks("ghost").len(), 2);
         assert!(index.backlinks("nothing").is_empty());
         assert!(index.backlinks("").is_empty());
+    }
+
+    #[test]
+    fn completions_prefix_ranks_before_substring() {
+        let dir = folder();
+        let root = dir.path();
+        write(root, "my-ideas.md", "");
+        write(root, "ideas-2.md", "");
+        write(root, "IDEAS.md", "");
+        write(root, "zeta.md", "");
+        let index = LinkIndex::build(root).unwrap();
+        let got: Vec<String> = index
+            .completions("ide")
+            .into_iter()
+            .map(|c| c.target)
+            .collect();
+        assert_eq!(got, vec!["IDEAS", "ideas-2", "my-ideas"]);
+    }
+
+    #[test]
+    fn completions_are_case_insensitive_and_sorted_by_stem_then_path() {
+        let dir = folder();
+        let root = dir.path();
+        let b = write(root, "b/Plan.md", "");
+        let a = write(root, "a/plan.md", "");
+        write(root, "other.md", "");
+        let index = LinkIndex::build(root).unwrap();
+        let got = index.completions("PLA");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, a);
+        assert_eq!(got[1].path, b);
+        assert_eq!(got[0].target, "plan");
+    }
+
+    #[test]
+    fn completions_empty_prefix_lists_all_capped_at_50() {
+        let dir = folder();
+        let root = dir.path();
+        for i in 0..60 {
+            write(root, &format!("n{i:02}.md"), "");
+        }
+        let index = LinkIndex::build(root).unwrap();
+        let got = index.completions("");
+        assert_eq!(got.len(), 50);
+        assert_eq!(got[0].target, "n00");
+        assert_eq!(index.completions("  ").len(), 50);
+    }
+
+    #[test]
+    fn completions_cap_keeps_best_ranked() {
+        let dir = folder();
+        let root = dir.path();
+        for i in 0..55 {
+            write(root, &format!("x-note{i:02}.md"), "");
+        }
+        write(root, "note.md", "");
+        let index = LinkIndex::build(root).unwrap();
+        let got = index.completions("note");
+        assert_eq!(got.len(), 50);
+        assert_eq!(got[0].target, "note");
+        assert_eq!(index.completions("x-note").len(), 50);
+        assert_eq!(index.completions("x-note")[0].target, "x-note00");
+    }
+
+    #[test]
+    fn completions_path_prefix_uses_folder_and_returns_path() {
+        let dir = folder();
+        let root = dir.path();
+        write(root, "work/ideas.md", "");
+        write(root, "home/ideas.md", "");
+        let index = LinkIndex::build(root).unwrap();
+        let got: Vec<String> = index
+            .completions("work/")
+            .into_iter()
+            .map(|c| c.target)
+            .collect();
+        assert_eq!(got, vec!["work/ideas"]);
+        assert!(index.completions("nothing").is_empty());
+    }
+
+    #[test]
+    fn rename_rewrites_plain_alias_and_heading() {
+        let dir = folder();
+        let root = dir.path();
+        let old = write(root, "old.md", "");
+        let new = root.join("fresh.md");
+        let src = write(
+            root,
+            "src.md",
+            "[[old]] [[old|Shown]] [[Old#Part]] [[old#Part|A]] [[old.md]]",
+        );
+        let index = LinkIndex::build(root).unwrap();
+        let out = index.rename_rewrite(&old, &new).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, src);
+        assert_eq!(
+            out[0].1,
+            "[[fresh]] [[fresh|Shown]] [[fresh#Part]] [[fresh#Part|A]] [[fresh.md]]"
+        );
+    }
+
+    #[test]
+    fn rename_keeps_spacing_inside_brackets() {
+        let dir = folder();
+        let root = dir.path();
+        let old = write(root, "old.md", "");
+        let new = root.join("fresh.md");
+        write(root, "src.md", "[[ old  |  Shown ]]");
+        let index = LinkIndex::build(root).unwrap();
+        let out = index.rename_rewrite(&old, &new).unwrap();
+        assert_eq!(out[0].1, "[[ fresh  |  Shown ]]");
+    }
+
+    #[test]
+    fn rename_path_qualified_link_gets_new_path() {
+        let dir = folder();
+        let root = dir.path();
+        let old = write(root, "notes/old.md", "");
+        let new = root.join("archive/new.md");
+        write(
+            root,
+            "src.md",
+            "[[notes/old]] and [[old]] and [[notes/old|X]]",
+        );
+        let index = LinkIndex::build(root).unwrap();
+        let out = index.rename_rewrite(&old, &new).unwrap();
+        assert_eq!(
+            out[0].1,
+            "[[archive/new]] and [[new]] and [[archive/new|X]]"
+        );
+    }
+
+    #[test]
+    fn rename_leaves_code_unrelated_and_other_files_alone() {
+        let dir = folder();
+        let root = dir.path();
+        let old = write(root, "old.md", "");
+        let new = root.join("fresh.md");
+        write(root, "code.md", "`[[old]]`\n```\n[[old]]\n```\n[[other]]");
+        write(root, "unrelated.md", "[[oldish]] [[other]]");
+        write(root, "plain.md", "no links");
+        let index = LinkIndex::build(root).unwrap();
+        assert!(index.rename_rewrite(&old, &new).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_skips_links_that_resolve_elsewhere() {
+        let dir = folder();
+        let root = dir.path();
+        let old = write(root, "sub/old.md", "");
+        write(root, "old.md", "");
+        let new = root.join("sub/fresh.md");
+        write(root, "src.md", "[[old]] [[sub/old]]");
+        let index = LinkIndex::build(root).unwrap();
+        let out = index.rename_rewrite(&old, &new).unwrap();
+        assert_eq!(out[0].1, "[[old]] [[sub/fresh]]");
+    }
+
+    #[test]
+    fn rename_reads_disk_not_index_and_writes_nothing() {
+        let dir = folder();
+        let root = dir.path();
+        let old = write(root, "old.md", "");
+        let src = write(root, "src.md", "[[old]]");
+        let mut index = LinkIndex::build(root).unwrap();
+        // Index is stale: the disk has the link, the index does not.
+        index.update_file(&src, "nothing");
+        let out = index.rename_rewrite(&old, &root.join("new.md")).unwrap();
+        assert_eq!(out[0].1, "[[new]]");
+        assert_eq!(fs::read_to_string(&src).unwrap(), "[[old]]");
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn rename_works_after_caller_removed_old_from_index() {
+        let dir = folder();
+        let root = dir.path();
+        let old = write(root, "old.md", "");
+        write(root, "src.md", "[[old]]");
+        let mut index = LinkIndex::build(root).unwrap();
+        index.remove_file(&old);
+        let out = index.rename_rewrite(&old, &root.join("new.md")).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "[[new]]");
+    }
+
+    #[test]
+    fn rename_same_name_is_noop() {
+        let dir = folder();
+        let root = dir.path();
+        let old = write(root, "old.md", "");
+        write(root, "src.md", "[[old]]");
+        let index = LinkIndex::build(root).unwrap();
+        assert!(index.rename_rewrite(&old, &old).unwrap().is_empty());
     }
 }

@@ -300,7 +300,10 @@ mod tests {
 
     #[test]
     fn trims_target_and_alias() {
-        assert_eq!(targets("[[  ideas  |  Shown  ]]"), vec![t("ideas", Some("Shown"))]);
+        assert_eq!(
+            targets("[[  ideas  |  Shown  ]]"),
+            vec![t("ideas", Some("Shown"))]
+        );
     }
 
     #[test]
