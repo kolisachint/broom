@@ -5,9 +5,19 @@
 //!
 //! Ordering: folders first, then files, each group by name (case-insensitive).
 //! `.git` is never listed. Every other file is shown.
+//!
+//! Symlinks are shown as files and never followed, so a link cannot make the
+//! tree loop.
 
+use std::cmp::Ordering;
+use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use crate::IGNORED_DIR_NAMES;
+
+/// Files never listed, on top of [`IGNORED_DIR_NAMES`].
+const IGNORED_FILE_NAMES: &[&str] = &[".DS_Store"];
 
 /// Kind of a file-system entry as shown in the tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,10 +62,10 @@ impl FileTree {
     /// Opens a tree rooted at `root`. Lists the root only.
     /// Errors if `root` is not a readable directory.
     pub fn open(root: &Path) -> io::Result<FileTree> {
-        if !root.is_dir() {
+        if !fs::metadata(root)?.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
-                format!("not a folder: {}", root.display()),
+                format!("{} is not a folder", root.display()),
             ));
         }
         let mut listings = std::collections::HashMap::new();
@@ -75,7 +85,7 @@ impl FileTree {
     /// Children of `dir`, sorted per the module rules. Lists `dir` from disk
     /// if it is not cached yet. `dir` must be the root or a folder inside it.
     pub fn children(&mut self, dir: &Path) -> io::Result<&[TreeEntry]> {
-        self.ensure_inside_root(dir)?;
+        self.check_inside(dir)?;
         if !self.listings.contains_key(dir) {
             let entries = list_dir(dir)?;
             self.listings.insert(dir.to_path_buf(), entries);
@@ -83,16 +93,24 @@ impl FileTree {
         Ok(self.listings[dir].as_slice())
     }
 
-    /// True if `dir` is expanded in the view.
+    /// True if `dir` is expanded in the view. The root is always expanded.
     pub fn is_expanded(&self, dir: &Path) -> bool {
-        self.expanded.contains(dir)
+        dir == self.root || self.expanded.contains(dir)
     }
 
     /// Sets the expanded state of `dir`. Expanding lists it if needed.
+    /// The root is always expanded, so this does nothing for the root.
     pub fn set_expanded(&mut self, dir: &Path, expanded: bool) -> io::Result<()> {
+        if dir == self.root {
+            return Ok(());
+        }
+        self.check_inside(dir)?;
         if expanded {
-            self.children(dir)?;
             self.expanded.insert(dir.to_path_buf());
+            if let Err(err) = self.load(dir) {
+                self.expanded.remove(dir);
+                return Err(err);
+            }
         } else {
             self.expanded.remove(dir);
         }
@@ -100,7 +118,11 @@ impl FileTree {
     }
 
     /// Flips the expanded state of `dir` and returns the new state.
+    /// The root is always expanded, so toggling it returns `true`.
     pub fn toggle(&mut self, dir: &Path) -> io::Result<bool> {
+        if dir == self.root {
+            return Ok(true);
+        }
         let next = !self.is_expanded(dir);
         self.set_expanded(dir, next)?;
         Ok(next)
@@ -109,34 +131,35 @@ impl FileTree {
     /// Flattened visible rows in display order. Children of expanded folders
     /// are included. Children of collapsed folders are not.
     pub fn rows(&self) -> Vec<TreeRow> {
-        let mut rows = Vec::new();
-        self.push_rows(&self.root, 0, &mut rows);
-        rows
+        let mut out = Vec::new();
+        self.push_rows(&self.root, 0, &mut out);
+        out
     }
 
     /// Drops the cached listing of `dir` after a watcher event. If `dir` is
-    /// expanded (or is the root), it is re-listed immediately so
-    /// [`FileTree::rows`] stays correct.
+    /// expanded, it is re-listed immediately so [`FileTree::rows`] stays correct.
+    ///
+    /// Cached listings of everything under `dir` are dropped too. If `dir`
+    /// itself has been deleted, its expanded state is cleared and this is `Ok`.
     pub fn invalidate(&mut self, dir: &Path) -> io::Result<()> {
-        self.listings.remove(dir);
-        if dir != self.root && !self.is_expanded(dir) {
+        self.check_inside(dir)?;
+        self.listings.retain(|path, _| !path.starts_with(dir));
+        if !self.is_expanded(dir) {
             return Ok(());
         }
-        match list_dir(dir) {
-            Ok(entries) => {
-                self.listings.insert(dir.to_path_buf(), entries);
-                Ok(())
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+        match self.load(dir) {
+            Err(err) if is_gone(&err) && dir != self.root => {
                 self.forget_subtree(dir);
                 Ok(())
             }
-            Err(err) => Err(err),
+            other => other,
         }
     }
 
-    fn ensure_inside_root(&self, dir: &Path) -> io::Result<()> {
-        if dir.starts_with(&self.root) {
+    /// Errors unless `dir` is the root or a folder inside it, with no `..`.
+    fn check_inside(&self, dir: &Path) -> io::Result<()> {
+        let escapes = dir.components().any(|c| matches!(c, Component::ParentDir));
+        if dir.starts_with(&self.root) && !escapes {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -146,14 +169,55 @@ impl FileTree {
         }
     }
 
-    // Appends the visible rows under `dir`. Uses cached listings only.
-    fn push_rows(&self, dir: &Path, depth: usize, rows: &mut Vec<TreeRow>) {
+    /// Lists `dir` if it is not cached, then does the same for every expanded
+    /// folder beneath it. After this, [`FileTree::rows`] can show the subtree.
+    fn load(&mut self, dir: &Path) -> io::Result<()> {
+        if !self.listings.contains_key(dir) {
+            let entries = list_dir(dir)?;
+            // Expanded children that no longer exist must not come back
+            // expanded if they reappear later.
+            let gone: Vec<PathBuf> = self
+                .expanded
+                .iter()
+                .filter(|path| {
+                    path.parent() == Some(dir) && !entries.iter().any(|e| e.path == **path)
+                })
+                .cloned()
+                .collect();
+            for path in gone {
+                self.forget_subtree(&path);
+            }
+            self.listings.insert(dir.to_path_buf(), entries);
+        }
+        let subdirs: Vec<PathBuf> = self.listings[dir]
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Dir && self.expanded.contains(&entry.path))
+            .map(|entry| entry.path.clone())
+            .collect();
+        for sub in subdirs {
+            match self.load(&sub) {
+                Ok(()) => {}
+                // Deleted or replaced while we were looking: stop showing it.
+                Err(err) if is_gone(&err) => self.forget_subtree(&sub),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops the expanded state and cached listings of `dir` and below.
+    fn forget_subtree(&mut self, dir: &Path) {
+        self.expanded.retain(|path| !path.starts_with(dir));
+        self.listings.retain(|path, _| !path.starts_with(dir));
+    }
+
+    fn push_rows(&self, dir: &Path, depth: usize, out: &mut Vec<TreeRow>) {
         let Some(entries) = self.listings.get(dir) else {
             return;
         };
         for entry in entries {
-            let expanded = entry.kind == EntryKind::Dir && self.is_expanded(&entry.path);
-            rows.push(TreeRow {
+            let expanded = entry.kind == EntryKind::Dir && self.expanded.contains(&entry.path);
+            out.push(TreeRow {
                 path: entry.path.clone(),
                 name: entry.name.clone(),
                 kind: entry.kind,
@@ -161,44 +225,54 @@ impl FileTree {
                 expanded,
             });
             if expanded {
-                self.push_rows(&entry.path, depth + 1, rows);
+                self.push_rows(&entry.path, depth + 1, out);
             }
         }
     }
-
-    // Drops `dir` and everything below it from the caches.
-    fn forget_subtree(&mut self, dir: &Path) {
-        self.listings.retain(|path, _| !path.starts_with(dir));
-        self.expanded.retain(|path| !path.starts_with(dir));
-    }
 }
 
-// Lists one folder from disk, hiding `.git`, sorted: folders first, then
-// names case-insensitively.
+/// True when `err` means the path no longer exists or is no longer a folder.
+fn is_gone(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+fn is_ignored(name: &str) -> bool {
+    IGNORED_DIR_NAMES.contains(&name) || IGNORED_FILE_NAMES.contains(&name)
+}
+
+/// Folders first, then by name, case-insensitive. Exact name breaks ties.
+fn compare_entries(a: &TreeEntry, b: &TreeEntry) -> Ordering {
+    (a.kind != EntryKind::Dir)
+        .cmp(&(b.kind != EntryKind::Dir))
+        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+/// Lists one folder from disk, without ignored names, sorted for display.
 fn list_dir(dir: &Path) -> io::Result<Vec<TreeEntry>> {
     let mut entries = Vec::new();
-    for item in std::fs::read_dir(dir)? {
-        let item = item?;
+    for item in fs::read_dir(dir)? {
+        // An entry that vanished during the listing is skipped.
+        let Ok(item) = item else { continue };
         let name = item.file_name().to_string_lossy().into_owned();
-        if crate::IGNORED_DIR_NAMES.contains(&name.as_str()) {
+        if is_ignored(&name) {
             continue;
         }
-        let path = item.path();
-        let kind = if path.is_dir() {
-            EntryKind::Dir
-        } else {
-            EntryKind::File
+        // `file_type` does not follow symlinks, so a link shows as a file.
+        let kind = match item.file_type() {
+            Ok(file_type) if file_type.is_dir() => EntryKind::Dir,
+            _ => EntryKind::File,
         };
-        entries.push(TreeEntry { name, path, kind });
+        entries.push(TreeEntry {
+            name,
+            path: item.path(),
+            kind,
+        });
     }
-    entries.sort_by(|a, b| {
-        let a_file = a.kind == EntryKind::File;
-        let b_file = b.kind == EntryKind::File;
-        a_file
-            .cmp(&b_file)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    entries.sort_by(compare_entries);
     Ok(entries)
 }
 
@@ -206,91 +280,339 @@ fn list_dir(dir: &Path) -> io::Result<Vec<TreeEntry>> {
 mod tests {
     use super::*;
 
-    fn fixture() -> tempfile::TempDir {
+    fn names(rows: &[TreeRow]) -> Vec<(usize, String)> {
+        rows.iter().map(|r| (r.depth, r.name.clone())).collect()
+    }
+
+    fn sample() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("Beta")).unwrap();
-        std::fs::create_dir_all(root.join("alpha")).unwrap();
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join("Beta/inner.md"), "").unwrap();
-        std::fs::write(root.join("zeta.txt"), "").unwrap();
-        std::fs::write(root.join("Apple.md"), "").unwrap();
-        dir
-    }
-
-    fn names(entries: &[TreeEntry]) -> Vec<&str> {
-        entries.iter().map(|e| e.name.as_str()).collect()
-    }
-
-    #[test]
-    fn open_rejects_non_directory() {
-        let dir = fixture();
-        assert!(FileTree::open(&dir.path().join("zeta.txt")).is_err());
+        let root = dir.path().to_path_buf();
+        fs::create_dir(root.join("beta")).unwrap();
+        fs::create_dir(root.join("Alpha")).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join("zeta.md"), "").unwrap();
+        fs::write(root.join("Apple.txt"), "").unwrap();
+        fs::write(root.join("banana.png"), "").unwrap();
+        fs::write(root.join(".DS_Store"), "").unwrap();
+        fs::write(root.join(".gitignore"), "").unwrap();
+        fs::write(root.join("beta/inner.md"), "").unwrap();
+        fs::write(root.join("beta/aa.md"), "").unwrap();
+        fs::create_dir(root.join("beta/sub")).unwrap();
+        (dir, root)
     }
 
     #[test]
-    fn children_sorted_folders_first_and_hide_git() {
-        let dir = fixture();
-        let mut tree = FileTree::open(dir.path()).unwrap();
-        let kids = tree.children(dir.path()).unwrap();
-        assert_eq!(names(kids), vec!["alpha", "Beta", "Apple.md", "zeta.txt"]);
-        assert_eq!(kids[0].kind, EntryKind::Dir);
-        assert_eq!(kids[3].kind, EntryKind::File);
+    fn open_lists_root_only() {
+        let (_guard, root) = sample();
+        let tree = FileTree::open(&root).unwrap();
+        assert!(tree.listings.contains_key(&root));
+        assert_eq!(tree.listings.len(), 1, "sub-folders must not be listed yet");
+        assert_eq!(tree.root(), root.as_path());
     }
 
     #[test]
-    fn children_rejects_outside_root() {
-        let dir = fixture();
-        let mut tree = FileTree::open(dir.path()).unwrap();
-        assert!(tree.children(Path::new("/")).is_err());
-    }
-
-    #[test]
-    fn rows_include_only_expanded_children() {
-        let dir = fixture();
-        let root = dir.path();
-        let mut tree = FileTree::open(root).unwrap();
-        assert_eq!(tree.rows().len(), 4);
-        assert!(tree.toggle(&root.join("Beta")).unwrap());
-        let rows = tree.rows();
-        let got: Vec<(&str, usize)> = rows.iter().map(|r| (r.name.as_str(), r.depth)).collect();
+    fn children_sorted_dirs_first_case_insensitive_and_ignores_git() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let got: Vec<(EntryKind, String)> = tree
+            .children(&root)
+            .unwrap()
+            .iter()
+            .map(|e| (e.kind, e.name.clone()))
+            .collect();
         assert_eq!(
             got,
             vec![
-                ("alpha", 0),
-                ("Beta", 0),
-                ("inner.md", 1),
-                ("Apple.md", 0),
-                ("zeta.txt", 0)
+                (EntryKind::Dir, "Alpha".into()),
+                (EntryKind::Dir, "beta".into()),
+                (EntryKind::File, ".gitignore".into()),
+                (EntryKind::File, "Apple.txt".into()),
+                (EntryKind::File, "banana.png".into()),
+                (EntryKind::File, "zeta.md".into()),
             ]
         );
-        assert!(rows[1].expanded);
-        assert!(!tree.toggle(&root.join("Beta")).unwrap());
-        assert_eq!(tree.rows().len(), 4);
     }
 
     #[test]
-    fn invalidate_relists_expanded_folder() {
-        let dir = fixture();
-        let root = dir.path();
-        let mut tree = FileTree::open(root).unwrap();
-        tree.set_expanded(&root.join("Beta"), true).unwrap();
-        std::fs::write(root.join("Beta/new.md"), "").unwrap();
-        tree.invalidate(&root.join("Beta")).unwrap();
-        let names: Vec<String> = tree.rows().into_iter().map(|r| r.name).collect();
-        assert!(names.contains(&"new.md".to_string()));
+    fn children_paths_are_full_paths() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        let entries = tree.children(&beta).unwrap();
+        assert_eq!(entries[0].name, "sub");
+        assert_eq!(entries[0].path, beta.join("sub"));
+        assert!(entries.iter().any(|e| e.path == beta.join("aa.md")));
     }
 
     #[test]
-    fn invalidate_removed_expanded_folder_collapses_it() {
-        let dir = fixture();
-        let root = dir.path();
-        let mut tree = FileTree::open(root).unwrap();
-        tree.set_expanded(&root.join("Beta"), true).unwrap();
-        std::fs::remove_dir_all(root.join("Beta")).unwrap();
-        tree.invalidate(&root.join("Beta")).unwrap();
-        tree.invalidate(root).unwrap();
-        assert!(!tree.is_expanded(&root.join("Beta")));
-        assert_eq!(tree.rows().len(), 3);
+    fn children_lists_folder_lazily() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        assert!(!tree.listings.contains_key(&beta));
+        assert_eq!(tree.children(&beta).unwrap().len(), 3);
+        assert!(tree.listings.contains_key(&beta));
+    }
+
+    #[test]
+    fn children_outside_root_is_error() {
+        let (guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let outside = guard.path().parent().unwrap().join("elsewhere");
+        assert_eq!(
+            tree.children(&outside).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            tree.children(&root.join("beta/../../x"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn open_rejects_missing_and_file_roots() {
+        let (_guard, root) = sample();
+        assert!(FileTree::open(&root.join("missing")).is_err());
+        assert_eq!(
+            FileTree::open(&root.join("zeta.md")).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+    }
+
+    #[test]
+    fn rows_collapsed_by_default() {
+        let (_guard, root) = sample();
+        let tree = FileTree::open(&root).unwrap();
+        let rows = tree.rows();
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|r| r.depth == 0));
+        assert!(!rows[0].expanded);
+        assert_eq!(rows[0].kind, EntryKind::Dir);
+    }
+
+    #[test]
+    fn expand_shows_children_and_collapse_hides_them() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+
+        tree.set_expanded(&beta, true).unwrap();
+        assert!(tree.is_expanded(&beta));
+        let rows = tree.rows();
+        assert_eq!(
+            names(&rows),
+            vec![
+                (0, "Alpha".into()),
+                (0, "beta".into()),
+                (1, "sub".into()),
+                (1, "aa.md".into()),
+                (1, "inner.md".into()),
+                (0, ".gitignore".into()),
+                (0, "Apple.txt".into()),
+                (0, "banana.png".into()),
+                (0, "zeta.md".into()),
+            ]
+        );
+        let beta_row = rows.iter().find(|r| r.name == "beta").unwrap();
+        assert!(beta_row.expanded);
+        assert_eq!(beta_row.path, beta);
+
+        tree.set_expanded(&beta, false).unwrap();
+        assert!(!tree.is_expanded(&beta));
+        assert_eq!(tree.rows().len(), 6);
+    }
+
+    #[test]
+    fn nested_expansion_increases_depth() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        tree.set_expanded(&root.join("beta"), true).unwrap();
+        tree.set_expanded(&root.join("beta/sub"), true).unwrap();
+        let rows = tree.rows();
+        assert!(rows.iter().all(|r| r.depth <= 1));
+        assert_eq!(rows.len(), 9);
+
+        // A file deeper down shows at depth 2.
+        let deep = root.join("beta/sub/deep.md");
+        fs::write(&deep, "").unwrap();
+        tree.invalidate(&root.join("beta/sub")).unwrap();
+        let rows = tree.rows();
+        let row = rows.iter().find(|r| r.path == deep).unwrap();
+        assert_eq!(row.depth, 2);
+    }
+
+    #[test]
+    fn collapsing_parent_keeps_child_state_for_reexpand() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        let sub = root.join("beta/sub");
+        tree.set_expanded(&beta, true).unwrap();
+        tree.set_expanded(&sub, true).unwrap();
+        tree.set_expanded(&beta, false).unwrap();
+        assert!(tree.is_expanded(&sub));
+
+        tree.set_expanded(&beta, true).unwrap();
+        assert!(tree.rows().iter().any(|r| r.path == sub && r.expanded));
+    }
+
+    #[test]
+    fn toggle_flips_and_returns_new_state() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        assert!(tree.toggle(&beta).unwrap());
+        assert!(tree.is_expanded(&beta));
+        assert!(!tree.toggle(&beta).unwrap());
+        assert!(!tree.is_expanded(&beta));
+    }
+
+    #[test]
+    fn root_is_always_expanded() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        assert!(tree.is_expanded(&root));
+        tree.set_expanded(&root, false).unwrap();
+        assert!(tree.is_expanded(&root));
+        assert!(tree.toggle(&root).unwrap());
+        assert_eq!(tree.rows().len(), 6);
+    }
+
+    #[test]
+    fn set_expanded_on_file_is_error_and_not_recorded() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let file = root.join("zeta.md");
+        assert!(tree.set_expanded(&file, true).is_err());
+        assert!(!tree.is_expanded(&file));
+    }
+
+    #[test]
+    fn invalidate_picks_up_new_file_in_expanded_folder() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        tree.set_expanded(&beta, true).unwrap();
+
+        fs::write(beta.join("new.md"), "").unwrap();
+        tree.invalidate(&beta).unwrap();
+        assert!(tree.rows().iter().any(|r| r.path == beta.join("new.md")));
+    }
+
+    #[test]
+    fn invalidate_root_picks_up_new_folder() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        fs::create_dir(root.join("aaa-new")).unwrap();
+        tree.invalidate(&root).unwrap();
+        // "aaa-new" sorts before "Alpha" case-insensitively, and is a folder.
+        let rows = tree.rows();
+        assert_eq!(rows[0].name, "aaa-new");
+        assert_eq!(rows[0].kind, EntryKind::Dir);
+    }
+
+    #[test]
+    fn invalidate_collapsed_folder_drops_cache_only() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        tree.children(&beta).unwrap();
+        fs::write(beta.join("late.md"), "").unwrap();
+
+        tree.invalidate(&beta).unwrap();
+        assert!(!tree.listings.contains_key(&beta));
+        assert!(!tree.rows().iter().any(|r| r.name == "late.md"));
+        assert!(
+            tree.children(&beta)
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "late.md")
+        );
+    }
+
+    #[test]
+    fn invalidate_removes_rows_for_deleted_expanded_folder() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        let sub = beta.join("sub");
+        tree.set_expanded(&beta, true).unwrap();
+        tree.set_expanded(&sub, true).unwrap();
+
+        fs::remove_dir_all(&sub).unwrap();
+        tree.invalidate(&beta).unwrap();
+        assert!(!tree.rows().iter().any(|r| r.path == sub));
+        assert!(!tree.is_expanded(&sub));
+    }
+
+    #[test]
+    fn invalidate_deleted_expanded_folder_itself_is_ok() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        tree.set_expanded(&beta, true).unwrap();
+
+        fs::remove_dir_all(&beta).unwrap();
+        tree.invalidate(&beta).unwrap();
+        assert!(!tree.is_expanded(&beta));
+        // The parent still lists `beta` until it is invalidated too, as the
+        // watcher flow does for a removed folder.
+        tree.invalidate(&root).unwrap();
+        assert!(!tree.rows().iter().any(|r| r.path.starts_with(&beta)));
+    }
+
+    #[test]
+    fn deleted_expanded_child_is_pruned_when_parent_is_relisted() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        let sub = beta.join("sub");
+        tree.set_expanded(&beta, true).unwrap();
+        tree.set_expanded(&sub, true).unwrap();
+        // Collapse the parent, delete the child, then expand the parent again.
+        tree.set_expanded(&beta, false).unwrap();
+        fs::remove_dir_all(&sub).unwrap();
+        tree.invalidate(&beta).unwrap();
+        tree.set_expanded(&beta, true).unwrap();
+        assert!(!tree.is_expanded(&sub));
+        assert!(!tree.rows().iter().any(|r| r.path == sub));
+        assert_eq!(tree.rows().len(), 8);
+    }
+
+    #[test]
+    fn recreated_folder_is_listed_fresh() {
+        let (_guard, root) = sample();
+        let mut tree = FileTree::open(&root).unwrap();
+        let beta = root.join("beta");
+        tree.set_expanded(&beta, true).unwrap();
+        fs::write(beta.join("old.md"), "").unwrap();
+        tree.invalidate(&beta).unwrap();
+        assert!(tree.rows().iter().any(|r| r.name == "old.md"));
+
+        fs::remove_file(beta.join("old.md")).unwrap();
+        tree.invalidate(&beta).unwrap();
+        assert!(!tree.rows().iter().any(|r| r.name == "old.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_folder_is_a_file_and_not_followed() {
+        let (_guard, root) = sample();
+        std::os::unix::fs::symlink(root.join("beta"), root.join("link-to-beta")).unwrap();
+        let mut tree = FileTree::open(&root).unwrap();
+        let entry = tree
+            .children(&root)
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "link-to-beta")
+            .unwrap();
+        assert_eq!(entry.kind, EntryKind::File);
+
+        // A link to the root itself must not make the tree recurse.
+        std::os::unix::fs::symlink(&root, root.join("beta/loop")).unwrap();
+        tree.set_expanded(&root.join("beta"), true).unwrap();
+        assert!(tree.rows().len() < 50);
     }
 }

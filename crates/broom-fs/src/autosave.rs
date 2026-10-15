@@ -41,12 +41,16 @@ impl AutoSaver {
     }
 
     /// Paths whose deadline is at or before `now`. Removes them from the
-    /// pending set; the caller must save them.
+    /// pending set; the caller must save them. Sorted by path.
     pub fn take_due(&mut self, now: Instant) -> Vec<PathBuf> {
+        let delay = self.delay;
         let mut due: Vec<PathBuf> = self
             .pending
             .iter()
-            .filter(|(_, last)| **last + self.delay <= now)
+            .filter(|(_, last)| {
+                now.checked_duration_since(**last)
+                    .is_some_and(|elapsed| elapsed >= delay)
+            })
             .map(|(path, _)| path.clone())
             .collect();
         for path in &due {
@@ -58,7 +62,10 @@ impl AutoSaver {
 
     /// Earliest pending deadline, for scheduling a wake-up. `None` if idle.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.pending.values().min().map(|last| *last + self.delay)
+        self.pending
+            .values()
+            .min()
+            .and_then(|last| last.checked_add(self.delay))
     }
 
     /// True if any save is pending.
@@ -71,70 +78,134 @@ impl AutoSaver {
 mod tests {
     use super::*;
 
-    fn saver() -> AutoSaver {
-        AutoSaver::new(Duration::from_millis(1000))
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
     }
 
     #[test]
-    fn idle_has_no_deadline() {
-        let s = saver();
-        assert!(!s.has_pending());
-        assert_eq!(s.next_deadline(), None);
+    fn idle_scheduler_has_nothing() {
+        let mut saver = AutoSaver::new(ms(1000));
+        let now = Instant::now();
+        assert!(!saver.has_pending());
+        assert_eq!(saver.next_deadline(), None);
+        assert!(saver.take_due(now + ms(5000)).is_empty());
     }
 
     #[test]
-    fn untitled_is_never_scheduled() {
-        let mut s = saver();
+    fn edit_is_due_only_after_delay() {
+        let mut saver = AutoSaver::new(ms(1000));
         let t0 = Instant::now();
-        s.note_edit(None, t0);
-        assert!(!s.has_pending());
-        assert!(s.take_due(t0 + Duration::from_secs(60)).is_empty());
+        let path = PathBuf::from("/notes/a.md");
+        saver.note_edit(Some(&path), t0);
+
+        assert!(saver.has_pending());
+        assert_eq!(saver.next_deadline(), Some(t0 + ms(1000)));
+        assert!(saver.take_due(t0 + ms(999)).is_empty());
+        assert_eq!(saver.take_due(t0 + ms(1000)), vec![path.clone()]);
+        assert!(!saver.has_pending());
     }
 
     #[test]
-    fn due_only_after_delay() {
-        let mut s = saver();
+    fn take_due_removes_so_second_call_is_empty() {
+        let mut saver = AutoSaver::new(ms(10));
         let t0 = Instant::now();
-        let p = PathBuf::from("/notes/a.md");
-        s.note_edit(Some(&p), t0);
-        assert!(s.has_pending());
-        assert_eq!(s.next_deadline(), Some(t0 + Duration::from_millis(1000)));
-        assert!(s.take_due(t0 + Duration::from_millis(999)).is_empty());
-        assert_eq!(s.take_due(t0 + Duration::from_millis(1000)), vec![p]);
-        assert!(!s.has_pending());
+        saver.note_edit(Some(Path::new("/a.md")), t0);
+        assert_eq!(saver.take_due(t0 + ms(10)).len(), 1);
+        assert!(saver.take_due(t0 + ms(10)).is_empty());
     }
 
     #[test]
-    fn new_edit_pushes_deadline_back() {
-        let mut s = saver();
+    fn further_edits_push_deadline_back() {
+        let mut saver = AutoSaver::new(ms(1000));
         let t0 = Instant::now();
-        let p = PathBuf::from("/notes/a.md");
-        s.note_edit(Some(&p), t0);
-        s.note_edit(Some(&p), t0 + Duration::from_millis(800));
-        assert!(s.take_due(t0 + Duration::from_millis(1000)).is_empty());
-        assert_eq!(s.take_due(t0 + Duration::from_millis(1800)).len(), 1);
+        let path = Path::new("/a.md");
+        saver.note_edit(Some(path), t0);
+        saver.note_edit(Some(path), t0 + ms(800));
+        saver.note_edit(Some(path), t0 + ms(1500));
+
+        assert_eq!(saver.next_deadline(), Some(t0 + ms(2500)));
+        assert!(saver.take_due(t0 + ms(2000)).is_empty());
+        assert_eq!(saver.take_due(t0 + ms(2500)), vec![path.to_path_buf()]);
     }
 
     #[test]
-    fn cancel_removes_pending() {
-        let mut s = saver();
+    fn untitled_buffers_are_never_scheduled() {
+        let mut saver = AutoSaver::new(ms(0));
         let t0 = Instant::now();
-        let p = PathBuf::from("/notes/a.md");
-        s.note_edit(Some(&p), t0);
-        s.cancel(&p);
-        assert!(!s.has_pending());
-        assert!(s.take_due(t0 + Duration::from_secs(5)).is_empty());
+        saver.note_edit(None, t0);
+        assert!(!saver.has_pending());
+        assert_eq!(saver.next_deadline(), None);
+        assert!(saver.take_due(t0 + ms(100)).is_empty());
     }
 
     #[test]
-    fn next_deadline_is_earliest() {
-        let mut s = saver();
+    fn cancel_removes_pending_save() {
+        let mut saver = AutoSaver::new(ms(1000));
         let t0 = Instant::now();
-        s.note_edit(Some(Path::new("/a.md")), t0 + Duration::from_millis(300));
-        s.note_edit(Some(Path::new("/b.md")), t0);
-        assert_eq!(s.next_deadline(), Some(t0 + Duration::from_millis(1000)));
-        let due = s.take_due(t0 + Duration::from_millis(1000));
-        assert_eq!(due, vec![PathBuf::from("/b.md")]);
-        assert_eq!(s.next_deadline(), Some(t0 + Duration::from_millis(1300)));
+        let a = Path::new("/a.md");
+        let b = Path::new("/b.md");
+        saver.note_edit(Some(a), t0);
+        saver.note_edit(Some(b), t0);
+
+        saver.cancel(a);
+        assert_eq!(saver.take_due(t0 + ms(1000)), vec![b.to_path_buf()]);
+        // Cancelling something not pending is harmless.
+        saver.cancel(a);
+    }
+
+    #[test]
+    fn next_deadline_is_earliest_of_several_paths() {
+        let mut saver = AutoSaver::new(ms(100));
+        let t0 = Instant::now();
+        saver.note_edit(Some(Path::new("/late.md")), t0 + ms(300));
+        saver.note_edit(Some(Path::new("/early.md")), t0);
+        assert_eq!(saver.next_deadline(), Some(t0 + ms(100)));
+    }
+
+    #[test]
+    fn take_due_returns_only_due_paths_sorted() {
+        let mut saver = AutoSaver::new(ms(100));
+        let t0 = Instant::now();
+        saver.note_edit(Some(Path::new("/z.md")), t0);
+        saver.note_edit(Some(Path::new("/m.md")), t0);
+        saver.note_edit(Some(Path::new("/late.md")), t0 + ms(500));
+
+        assert_eq!(
+            saver.take_due(t0 + ms(100)),
+            vec![PathBuf::from("/m.md"), PathBuf::from("/z.md")]
+        );
+        assert!(saver.has_pending());
+        assert_eq!(
+            saver.take_due(t0 + ms(600)),
+            vec![PathBuf::from("/late.md")]
+        );
+    }
+
+    #[test]
+    fn zero_delay_is_due_immediately() {
+        let mut saver = AutoSaver::new(Duration::ZERO);
+        let t0 = Instant::now();
+        saver.note_edit(Some(Path::new("/a.md")), t0);
+        assert_eq!(saver.take_due(t0).len(), 1);
+    }
+
+    #[test]
+    fn due_path_is_saved_atomically_by_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "original").unwrap();
+
+        let mut saver = AutoSaver::new(ms(50));
+        let t0 = Instant::now();
+        saver.note_edit(Some(&file), t0);
+        // Not yet due: the file is untouched.
+        assert!(saver.take_due(t0 + ms(10)).is_empty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+
+        for path in saver.take_due(t0 + ms(50)) {
+            crate::write_atomic(&path, "edited").unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "edited");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

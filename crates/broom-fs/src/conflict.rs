@@ -9,7 +9,12 @@
 //!    Same hash → no conflict (only the mtime moved). Update the stamp.
 //!    Different hash → [`ConflictKind::Modified`].
 //! 3. File gone → [`ConflictKind::Deleted`].
+//!
+//! A conflict is reported again on every `check` until the caller resolves
+//! it: after Reload or Keep mine (or a save), call [`ConflictDetector::record`]
+//! with the contents now held. Our own saves then never look like a conflict.
 
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -51,7 +56,7 @@ impl ConflictDetector {
     /// Records the state broom now holds for `path`: `contents` is what was
     /// just read from or written to disk. Reads the mtime from disk.
     pub fn record(&mut self, path: &Path, contents: &str) -> io::Result<()> {
-        let mtime = std::fs::metadata(path)?.modified().ok();
+        let mtime = fs::metadata(path)?.modified().ok();
         self.stamps.insert(
             path.to_path_buf(),
             Stamp {
@@ -66,44 +71,41 @@ impl ConflictDetector {
     /// is no conflict, or when `path` was never recorded. `&mut self` because
     /// a benign mtime-only change refreshes the stored mtime.
     pub fn check(&mut self, path: &Path) -> io::Result<Option<Conflict>> {
-        let Some(stamp) = self.stamps.get(path) else {
+        let Some((stamped_mtime, stamped_hash)) = self.stamps.get(path).map(|s| (s.mtime, s.hash))
+        else {
             return Ok(None);
         };
-        let conflict = |kind| {
-            Ok(Some(Conflict {
-                path: path.to_path_buf(),
-                kind,
-            }))
-        };
 
-        let meta = match std::fs::metadata(path) {
-            Ok(meta) => meta,
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return conflict(ConflictKind::Deleted);
+                return Ok(Some(deleted(path)));
             }
             Err(err) => return Err(err),
         };
-        let mtime = meta.modified().ok();
-        if mtime == stamp.mtime {
+        let mtime = metadata.modified().ok();
+        if mtime == stamped_mtime {
             return Ok(None);
         }
 
-        let bytes = match std::fs::read(path) {
+        let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return conflict(ConflictKind::Deleted);
+                return Ok(Some(deleted(path)));
             }
             Err(err) => return Err(err),
         };
-        let hash = hash_bytes(&bytes);
-        if hash == stamp.hash {
-            // Only the mtime moved. Remember the new mtime, report nothing.
+        if fnv_hash(&bytes) == stamped_hash {
+            // Only the mtime moved. Remember the new mtime so it is not re-read.
             if let Some(stamp) = self.stamps.get_mut(path) {
                 stamp.mtime = mtime;
             }
             return Ok(None);
         }
-        conflict(ConflictKind::Modified)
+        Ok(Some(Conflict {
+            path: path.to_path_buf(),
+            kind: ConflictKind::Modified,
+        }))
     }
 
     /// Stops tracking `path` (closed tab, or deleted by broom).
@@ -113,17 +115,19 @@ impl ConflictDetector {
 
     /// Stable content hash used for stamps. Not cryptographic.
     pub fn hash_contents(contents: &str) -> u64 {
-        hash_bytes(contents.as_bytes())
+        fnv_hash(contents.as_bytes())
     }
 }
 
-// FNV-1a, 64-bit. Stable across runs and platforms, unlike `DefaultHasher`.
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    bytes.iter().fold(OFFSET, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
-    })
+fn deleted(path: &Path) -> Conflict {
+    Conflict {
+        path: path.to_path_buf(),
+        kind: ConflictKind::Deleted,
+    }
+}
+
+fn fnv_hash(bytes: &[u8]) -> u64 {
+    crate::fnv1a(bytes)
 }
 
 #[cfg(test)]
@@ -131,15 +135,171 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
-    // Moves the mtime forward so the change is visible even on coarse clocks.
-    fn bump_mtime(path: &Path) {
-        let file = std::fs::File::options().write(true).open(path).unwrap();
-        file.set_modified(SystemTime::now() + Duration::from_secs(30))
-            .unwrap();
+    fn write(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+    }
+
+    /// Moves the mtime to a known value so the test does not depend on the
+    /// clock's granularity.
+    fn set_mtime(path: &Path, when: SystemTime) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    fn base_time() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
     }
 
     #[test]
-    fn hash_is_stable_and_content_sensitive() {
+    fn never_recorded_path_has_no_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "x");
+        let mut detector = ConflictDetector::new();
+        assert_eq!(detector.check(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn unchanged_file_has_no_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "hello");
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "hello").unwrap();
+        assert_eq!(detector.check(&file).unwrap(), None);
+        assert_eq!(detector.check(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn own_save_does_not_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "before");
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "before").unwrap();
+
+        // broom saves: write, then record what it wrote.
+        crate::write_atomic(&file, "after").unwrap();
+        detector.record(&file, "after").unwrap();
+        assert_eq!(detector.check(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn benign_mtime_only_change_refreshes_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "same text");
+        set_mtime(&file, base_time());
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "same text").unwrap();
+
+        // Touch the mtime; content is identical (e.g. `touch`, or a sync tool).
+        set_mtime(&file, base_time() + Duration::from_secs(60));
+        assert_eq!(detector.check(&file).unwrap(), None);
+
+        let stamp = detector.stamps.get(&file).unwrap();
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(stamp.mtime, Some(mtime), "stored mtime must be refreshed");
+        assert_eq!(detector.check(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn real_external_change_is_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "mine");
+        set_mtime(&file, base_time());
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "mine").unwrap();
+
+        write(&file, "theirs");
+        set_mtime(&file, base_time() + Duration::from_secs(60));
+        assert_eq!(
+            detector.check(&file).unwrap(),
+            Some(Conflict {
+                path: file.clone(),
+                kind: ConflictKind::Modified,
+            })
+        );
+    }
+
+    #[test]
+    fn conflict_repeats_until_resolved_by_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "mine");
+        set_mtime(&file, base_time());
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "mine").unwrap();
+
+        write(&file, "theirs");
+        set_mtime(&file, base_time() + Duration::from_secs(60));
+        assert!(detector.check(&file).unwrap().is_some());
+        assert!(detector.check(&file).unwrap().is_some());
+
+        // "Reload": broom now holds the disk contents.
+        detector.record(&file, "theirs").unwrap();
+        assert_eq!(detector.check(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn deleted_file_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "x");
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "x").unwrap();
+
+        fs::remove_file(&file).unwrap();
+        assert_eq!(
+            detector.check(&file).unwrap(),
+            Some(Conflict {
+                path: file.clone(),
+                kind: ConflictKind::Deleted,
+            })
+        );
+    }
+
+    #[test]
+    fn recreated_file_with_same_contents_is_not_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "x");
+        set_mtime(&file, base_time());
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "x").unwrap();
+
+        fs::remove_file(&file).unwrap();
+        assert!(detector.check(&file).unwrap().is_some());
+        write(&file, "x");
+        set_mtime(&file, base_time() + Duration::from_secs(5));
+        assert_eq!(detector.check(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn forgotten_path_has_no_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "mine");
+        set_mtime(&file, base_time());
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "mine").unwrap();
+        write(&file, "theirs");
+        set_mtime(&file, base_time() + Duration::from_secs(60));
+
+        detector.forget(&file);
+        assert_eq!(detector.check(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn record_missing_file_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut detector = ConflictDetector::new();
+        assert!(detector.record(&dir.path().join("nope.md"), "x").is_err());
+    }
+
+    #[test]
+    fn hash_is_stable_and_distinguishes_contents() {
         assert_eq!(
             ConflictDetector::hash_contents("abc"),
             ConflictDetector::hash_contents("abc")
@@ -148,93 +308,9 @@ mod tests {
             ConflictDetector::hash_contents("abc"),
             ConflictDetector::hash_contents("abd")
         );
-        assert_eq!(ConflictDetector::hash_contents(""), 0xcbf2_9ce4_8422_2325);
-    }
-
-    #[test]
-    fn unrecorded_path_is_no_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut det = ConflictDetector::new();
-        assert_eq!(det.check(&dir.path().join("x.md")).unwrap(), None);
-    }
-
-    #[test]
-    fn unchanged_file_is_no_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.md");
-        std::fs::write(&path, "one").unwrap();
-        let mut det = ConflictDetector::new();
-        det.record(&path, "one").unwrap();
-        assert_eq!(det.check(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn changed_content_is_modified() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.md");
-        std::fs::write(&path, "one").unwrap();
-        let mut det = ConflictDetector::new();
-        det.record(&path, "one").unwrap();
-        std::fs::write(&path, "two").unwrap();
-        bump_mtime(&path);
-        let got = det.check(&path).unwrap();
-        assert_eq!(
-            got,
-            Some(Conflict {
-                path: path.clone(),
-                kind: ConflictKind::Modified
-            })
+        assert_ne!(
+            ConflictDetector::hash_contents(""),
+            ConflictDetector::hash_contents("\n")
         );
-    }
-
-    #[test]
-    fn mtime_only_change_is_no_conflict_and_refreshes_stamp() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.md");
-        std::fs::write(&path, "same").unwrap();
-        let mut det = ConflictDetector::new();
-        det.record(&path, "same").unwrap();
-        bump_mtime(&path);
-        assert_eq!(det.check(&path).unwrap(), None);
-        // The stamp now has the new mtime, so the next check short-circuits.
-        assert_eq!(det.check(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn removed_file_is_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.md");
-        std::fs::write(&path, "one").unwrap();
-        let mut det = ConflictDetector::new();
-        det.record(&path, "one").unwrap();
-        std::fs::remove_file(&path).unwrap();
-        let got = det.check(&path).unwrap().unwrap();
-        assert_eq!(got.kind, ConflictKind::Deleted);
-    }
-
-    #[test]
-    fn record_after_external_change_clears_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.md");
-        std::fs::write(&path, "one").unwrap();
-        let mut det = ConflictDetector::new();
-        det.record(&path, "one").unwrap();
-        std::fs::write(&path, "two").unwrap();
-        bump_mtime(&path);
-        assert!(det.check(&path).unwrap().is_some());
-        det.record(&path, "two").unwrap();
-        assert_eq!(det.check(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn forget_stops_tracking() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.md");
-        std::fs::write(&path, "one").unwrap();
-        let mut det = ConflictDetector::new();
-        det.record(&path, "one").unwrap();
-        det.forget(&path);
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(det.check(&path).unwrap(), None);
     }
 }
