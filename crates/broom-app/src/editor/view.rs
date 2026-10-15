@@ -102,8 +102,12 @@ impl Render for Editor {
                 }
             }))
             .on_action(cx.listener(|this, run: &Run, _window, cx| {
+                // Actions stop propagation by default. Pass unhandled
+                // commands on so the workspace can run them.
                 if this.command(run.0, cx) {
                     cx.stop_propagation();
+                } else {
+                    cx.propagate();
                 }
             }))
     }

@@ -175,8 +175,8 @@ impl Workspace {
         let sheet = cx.new(Cheatsheet::new);
         let focus = sheet.read(cx).focus_handle();
         window.focus(&focus, cx);
-        let sub = cx.subscribe(&sheet, |this, _, _: &CheatsheetEvent, cx| {
-            this.close_overlay(cx);
+        let sub = cx.subscribe_in(&sheet, window, |this, _, _: &CheatsheetEvent, window, cx| {
+            this.close_overlay(window, cx);
         });
         self.show_overlay(sheet.into(), sub, cx);
     }

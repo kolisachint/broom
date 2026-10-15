@@ -30,7 +30,15 @@ impl Editor {
         }
         let m = ks.modifiers;
         // Cmd and Ctrl chords belong to the keymap, except Ctrl+R for vim redo.
+        // Cmd+Alt and Cmd+Ctrl are keymap chords (e.g. Cmd+Alt+V), not paste.
         if m.platform {
+            if m.alt || m.control {
+                return false;
+            }
+            // In vim normal or visual mode, clipboard keys must not insert text.
+            if self.vim_enabled && self.vim.mode() != broom_vim::Mode::Insert {
+                return false;
+            }
             return self.handle_cmd_key(&ks.key, cx);
         }
         if m.control && !(self.vim_enabled && ks.key == "r") {

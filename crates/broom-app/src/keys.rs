@@ -62,6 +62,22 @@ pub fn load_keymap() -> Option<Keymap> {
 
 /// Loads the keymap and registers every binding with GPUI. Call once at start.
 pub fn bind_keys(cx: &mut App) {
+    if std::env::var_os("BROOM_DEBUG_KEYS").is_some() {
+        cx.observe_keystrokes(|ev, _, _| {
+            let action = ev.action.as_ref().map(|a| match a.as_any().downcast_ref::<Run>() {
+                Some(Run(cmd)) => format!("Run({cmd:?})"),
+                None => a.name().to_string(),
+            });
+            let contexts: Vec<String> = ev.context_stack.iter().map(|c| format!("{c:?}")).collect();
+            eprintln!(
+                "broom: key {} action={:?} context={:?}",
+                ev.keystroke.unparse(),
+                action,
+                contexts
+            );
+        })
+        .detach();
+    }
     match load_keymap() {
         Some(keymap) => cx.bind_keys(keymap.bindings.iter().map(binding)),
         None => cx.bind_keys(FALLBACK.iter().map(|(keys, cmd, ctx)| {
@@ -124,6 +140,20 @@ pub fn focus_editor(ws: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
 }
 
 impl Workspace {
+    /// Moves keyboard focus to the centre editor. Used when an overlay closes.
+    pub fn focus_center(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.center.clone() else {
+            return;
+        };
+        editor.update(cx, |ed, cx| {
+            let handle = ed
+                .focus_handle
+                .get_or_insert_with(|| cx.focus_handle())
+                .clone();
+            window.focus(&handle, cx);
+        });
+    }
+
     /// Runs a command that reached the workspace (the editor did not take it).
     pub fn dispatch(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<Self>) {
         match cmd {

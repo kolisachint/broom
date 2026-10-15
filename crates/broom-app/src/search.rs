@@ -309,14 +309,17 @@ impl Workspace {
         let search = cx.new(|cx| FolderSearch::new(root, cx));
         let focus = search.read(cx).focus_handle();
         window.focus(&focus, cx);
-        let sub = cx.subscribe(&search, |this, _, event: &SearchEvent, cx| match event {
-            SearchEvent::OpenAt(path, _line) => {
-                // GAP: the line is not used yet; the editor has no goto-line.
-                let path = path.clone();
-                this.close_overlay(cx);
-                this.open_file(path, cx);
+        let sub = cx.subscribe_in(&search, window, |this, _, event: &SearchEvent, window, cx| {
+            match event {
+                SearchEvent::OpenAt(path, _line) => {
+                    // GAP: the line is not used yet; the editor has no goto-line.
+                    let path = path.clone();
+                    this.open_file(path, cx);
+                    this.close_overlay(window, cx);
+                    cx.defer_in(window, |this, window, cx| this.focus_center(window, cx));
+                }
+                SearchEvent::Dismiss => this.close_overlay(window, cx),
             }
-            SearchEvent::Dismiss => this.close_overlay(cx),
         });
         self.show_overlay(search.into(), sub, cx);
     }

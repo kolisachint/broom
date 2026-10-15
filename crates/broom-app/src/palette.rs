@@ -498,15 +498,17 @@ impl Workspace {
             |this, _, event: &PaletteEvent, window, cx| match event {
                 PaletteEvent::Run(cmd) => {
                     let cmd = *cmd;
-                    this.close_overlay(cx);
+                    this.close_overlay(window, cx);
                     this.run_command(cmd, window, cx);
                 }
                 PaletteEvent::Open(path) => {
                     let path = path.clone();
-                    this.close_overlay(cx);
                     this.open_file(path, cx);
+                    this.close_overlay(window, cx);
+                    // open_file is deferred, so focus the new centre editor after it runs.
+                    cx.defer_in(window, |this, window, cx| this.focus_center(window, cx));
                 }
-                PaletteEvent::Dismiss => this.close_overlay(cx),
+                PaletteEvent::Dismiss => this.close_overlay(window, cx),
             },
         );
         self.show_overlay(palette.into(), sub, cx);
@@ -524,10 +526,12 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Removes the overlay. Called on Escape and after each choice.
-    pub(crate) fn close_overlay(&mut self, cx: &mut Context<Self>) {
+    /// Removes the overlay and returns focus to the centre editor. Called on
+    /// Escape and after each choice.
+    pub(crate) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = None;
         self.overlay_sub = None;
+        self.focus_center(window, cx);
         cx.notify();
     }
 
