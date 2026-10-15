@@ -237,7 +237,8 @@ fn pieces(run: &Run) -> Vec<(Md, Vec<Span>)> {
         return vec![(Md::Raw(md), Vec::new())];
     }
     if s.math {
-        return vec![(Md::Raw(format!("${}$", run.text)), Vec::new())];
+        let d = if s.display_math { "$$" } else { "$" };
+        return vec![(Md::Raw(format!("{d}{}{d}", run.text)), Vec::new())];
     }
     if s.code {
         let longest = run.text.split(|c| c != '`').map(str::len).max().unwrap_or(0);

@@ -87,18 +87,21 @@ fn options() -> Options {
 }
 
 /// Returns `(end offset, yaml text)` when `src` starts with a `---` front matter block.
+/// A UTF-8 byte order mark before the first `---` is allowed.
 fn front_matter(src: &str) -> Option<(usize, String)> {
-    let mut lines = src.split_inclusive('\n');
+    let bom = if src.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
+    let body = &src[bom..];
+    let mut lines = body.split_inclusive('\n');
     if lines.next()?.trim_end_matches(['\r', '\n']) != "---" {
         return None;
     }
-    let mut offset = src.find('\n')? + 1;
+    let mut offset = body.find('\n')? + 1;
     let mut yaml_lines: Vec<&str> = Vec::new();
     for line in lines {
         let bare = line.trim_end_matches(['\r', '\n']);
         offset += line.len();
         if bare == "---" {
-            return Some((offset, yaml_lines.join("\n")));
+            return Some((bom + offset, yaml_lines.join("\n")));
         }
         yaml_lines.push(bare);
     }
@@ -111,6 +114,13 @@ fn top_level_groups(text: &str, base: usize) -> Vec<TopGroup<'_>> {
     let mut groups: Vec<TopGroup> = Vec::new();
     let mut depth = 0usize;
     for (ev, range) in Parser::new_ext(text, options()).into_offset_iter() {
+        let ev = match ev {
+            Event::Code(c) => match restore_code_spaces(text, &range, &c) {
+                Some(padded) => Event::Code(padded.into()),
+                None => Event::Code(c),
+            },
+            other => other,
+        };
         if depth == 0 && !matches!(ev, Event::End(_)) {
             groups.push((range.start + base, range.end + base, Vec::new(), Vec::new()));
         }
@@ -126,6 +136,22 @@ fn top_level_groups(text: &str, base: usize) -> Vec<TopGroup<'_>> {
         }
     }
     groups
+}
+
+/// A code span written with one space on each side (`` ` x ` ``) has those
+/// spaces stripped by the reader. This gives them back, so the text keeps them.
+/// Spans whose text starts or ends with a backtick keep the reader's form.
+fn restore_code_spaces(text: &str, range: &std::ops::Range<usize>, code: &str) -> Option<String> {
+    let src = text.get(range.clone())?;
+    let ticks = src.len() - src.trim_start_matches('`').len();
+    if src.len() < 2 * ticks + 2 {
+        return None;
+    }
+    let inner = &src[ticks..src.len() - ticks];
+    let padded = inner.starts_with(' ')
+        && inner.ends_with(' ')
+        && inner.bytes().any(|b| b != b' ');
+    (padded && !code.starts_with('`') && !code.ends_with('`')).then(|| format!(" {code} "))
 }
 
 /// One top-level block: (start, end, events, hard break form per event).
@@ -427,6 +453,7 @@ impl<'e, 'a> Builder<'e, 'a> {
                 Event::InlineMath(m) | Event::DisplayMath(m) => {
                     let mut s = style.clone();
                     s.math = true;
+                    s.display_math = matches!(ev, Event::DisplayMath(_));
                     push_run(&mut runs, m, &s);
                 }
                 Event::SoftBreak => push_run(&mut runs, "\n", &style),

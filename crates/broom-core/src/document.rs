@@ -859,6 +859,35 @@ mod edit_tests {
     }
 
     #[test]
+    fn bom_before_front_matter_still_parses() {
+        let doc = Document::parse("\u{feff}---\ntitle: x\n---\n\nbody\n");
+        assert!(matches!(doc.block(0).unwrap().kind(), BlockKind::FrontMatter { yaml } if yaml == "title: x"));
+        assert_eq!(doc.to_markdown(), "\u{feff}---\ntitle: x\n---\n\nbody\n");
+    }
+
+    #[test]
+    fn code_span_with_edge_spaces_survives_edit() {
+        let mut doc = Document::parse("a ` x ` b\n");
+        doc.insert_text(at(0, 0), "Z").unwrap();
+        assert_eq!(doc.to_markdown(), "Za ` x ` b\n");
+        assert_eq!(Document::parse(&doc.to_markdown()).visible_text(0).unwrap(), "Za  x  b");
+    }
+
+    #[test]
+    fn inline_display_math_is_kept_on_edit() {
+        let mut doc = Document::parse("$$a$$ text\n");
+        doc.insert_text(at(0, 0), "Z").unwrap();
+        assert_eq!(doc.to_markdown(), "Z$$a$$ text\n");
+    }
+
+    #[test]
+    fn code_conversion_keeps_link_urls_as_text() {
+        let mut doc = Document::parse("see [home](http://x.y) now\n");
+        doc.set_block_kind(0, BlockType::CodeBlock).unwrap();
+        assert_eq!(doc.visible_text(0).unwrap(), "see [home](http://x.y) now");
+    }
+
+    #[test]
     fn hard_break_keeps_its_source_form_after_edit() {
         for (src, brk) in [("foo  \nbar\n", "  \n"), ("foo\\\nbar\n", "\\\n")] {
             let mut doc = Document::parse(src);

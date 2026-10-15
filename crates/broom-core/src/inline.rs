@@ -23,6 +23,8 @@ pub struct Style {
     pub code: bool,
     /// Inline math `$...$`. `Run::text` is the TeX source, without dollars.
     pub math: bool,
+    /// Inline math written `$$...$$`. Only meaningful with `math`.
+    pub display_math: bool,
     /// Markdown link `[text](url)`. Holds the URL. `Run::text` is the link text.
     pub link: Option<String>,
     /// Wikilink `[[target|alias]]`.
