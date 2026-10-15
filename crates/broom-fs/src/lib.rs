@@ -112,6 +112,26 @@ pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
 ///
 /// `None` if the platform gave no mtime.
 pub fn write_atomic_stamped(path: &Path, bytes: &[u8]) -> io::Result<Option<SystemTime>> {
+    write_atomic_inner(path, bytes, None)
+}
+
+/// Owner-only ([`PRIVATE_MODE`]) variant of [`write_atomic`]. The mode is set
+/// on the temp file, so it is never readable by others. Used for recovery
+/// drafts, which can hold unsaved private text.
+pub(crate) fn write_atomic_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_inner(path, bytes, Some(PRIVATE_MODE)).map(|_| ())
+}
+
+/// Permissions for [`write_atomic_private`]: owner read and write only.
+pub(crate) const PRIVATE_MODE: u32 = 0o600;
+
+/// Shared body of the `write_atomic` family. `mode` of `None` keeps the mode
+/// of an existing target (or the umask default for a new file).
+fn write_atomic_inner(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> io::Result<Option<SystemTime>> {
     let target = match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
         _ => path.to_path_buf(),
@@ -135,8 +155,13 @@ pub fn write_atomic_stamped(path: &Path, bytes: &[u8]) -> io::Result<Option<Syst
 
     let result: io::Result<Option<SystemTime>> = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        if let Ok(meta) = fs::metadata(&target) {
-            file.set_permissions(meta.permissions())?;
+        match mode {
+            Some(mode) => set_mode(&file, mode)?,
+            None => {
+                if let Ok(meta) = fs::metadata(&target) {
+                    file.set_permissions(meta.permissions())?;
+                }
+            }
         }
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -159,6 +184,16 @@ pub fn write_atomic_stamped(path: &Path, bytes: &[u8]) -> io::Result<Option<Syst
         let _ = dir_handle.sync_all();
     }
     Ok(mtime)
+}
+
+#[cfg(unix)]
+fn set_mode(file: &File, mode: u32) -> io::Result<()> {
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_file: &File, _mode: u32) -> io::Result<()> {
+    Ok(())
 }
 
 /// FNV-1a, 64-bit. Fixed algorithm, so values stay the same across Rust

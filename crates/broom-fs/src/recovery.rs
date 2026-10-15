@@ -4,14 +4,19 @@
 //! dir (default `~/.local/state/broom/recovery`, see `broom_config::recovery_dir`):
 //!
 //! - `<key>.draft` — the buffer contents.
-//! - `<key>.meta`  — TOML with `original_path = "..."` (absent for untitled).
+//! - `<key>.meta`  — TOML with `original_path = "..."` (absent for untitled)
+//!   and `original_path_hex = "..."` (hex of the exact path bytes).
 //!
 //! `key` is [`Recovery::key_for_path`] for named files, or
 //! [`Recovery::new_untitled_key`] for untitled buffers. Keys are
 //! `[A-Za-z0-9_-]+` only, so they are safe as file names.
 //!
-//! A `.meta` file that cannot be parsed is ignored: the draft is still
-//! listed, as untitled. Non-UTF-8 paths are stored with lossy conversion.
+//! The directory is `0o700` and draft and meta files are `0o600` (Unix).
+//!
+//! Reading is best effort: a `.meta` that is unreadable or unparseable
+//! lists the draft as untitled. A `.meta` with no `.draft` is removed by
+//! [`Recovery::list`]. Do not call `list` while `write_draft` runs on
+//! another thread for the same key.
 
 use std::fs;
 use std::io;
@@ -19,11 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{fnv1a, write_atomic};
+use crate::{fnv1a, write_atomic_private};
 
 const DRAFT_EXT: &str = "draft";
 const META_EXT: &str = "meta";
 const META_KEY: &str = "original_path = ";
+const META_HEX_KEY: &str = "original_path_hex = ";
 
 /// Counter that keeps untitled keys unique within this process.
 static UNTITLED_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -46,8 +52,16 @@ pub struct Recovery {
 
 impl Recovery {
     /// Uses `dir` as the recovery directory. Does not create it yet.
-    pub fn new(dir: PathBuf) -> Recovery {
-        Recovery { dir }
+    /// Errors unless `dir` is absolute, so drafts never land in the
+    /// current working directory by accident.
+    pub fn new(dir: PathBuf) -> io::Result<Recovery> {
+        if !dir.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("recovery dir must be absolute: {}", dir.display()),
+            ));
+        }
+        Ok(Recovery { dir })
     }
 
     /// Stable key for a named file (hash of its absolute path, hex).
@@ -66,7 +80,7 @@ impl Recovery {
     }
 
     /// Writes (or overwrites) the draft for `key`. Creates the directory.
-    /// Uses [`crate::write_atomic`] so a crash never leaves a torn draft.
+    /// Uses an owner-only atomic write so a crash never leaves a torn draft.
     pub fn write_draft(
         &self,
         key: &str,
@@ -74,25 +88,29 @@ impl Recovery {
         contents: &str,
     ) -> io::Result<()> {
         check_key(key)?;
-        fs::create_dir_all(&self.dir)?;
+        self.ensure_dir()?;
         // Meta first: a draft is only listed when its `.draft` exists, so a
         // crash between the two writes never gives a named draft no path.
         let meta = self.meta_path(key);
         match original_path {
             Some(path) => {
-                let line = format!(
-                    "{META_KEY}\"{}\"\n",
-                    escape_toml_string(&path.to_string_lossy())
-                );
-                write_atomic(&meta, &line)?;
+                let text = meta_text(path);
+                // Same path as last time: skip the rewrite.
+                if fs::read_to_string(&meta).ok().as_deref() != Some(text.as_str()) {
+                    write_atomic_private(&meta, text.as_bytes())?;
+                }
             }
             None => remove_if_exists(&meta)?,
         }
-        write_atomic(&self.draft_path(key), contents)
+        write_atomic_private(&self.draft_path(key), contents.as_bytes())
     }
 
     /// All drafts currently on disk. Empty if the directory does not exist.
     /// Sorted by key.
+    ///
+    /// Drafts discarded during the listing are skipped. A `.meta` that cannot
+    /// be read lists its draft as untitled. A `.meta` with no `.draft` is
+    /// removed (best effort).
     pub fn list(&self) -> io::Result<Vec<RecoveryEntry>> {
         let read = match fs::read_dir(&self.dir) {
             Ok(read) => read,
@@ -101,25 +119,43 @@ impl Recovery {
         };
 
         let mut entries = Vec::new();
+        let mut meta_keys = Vec::new();
         for item in read {
             let item = item?;
             let file_name = item.file_name();
             let Some(name) = file_name.to_str() else {
                 continue;
             };
+            if let Some(key) = name.strip_suffix(".meta") {
+                if is_safe_key(key) {
+                    meta_keys.push(key.to_string());
+                }
+                continue;
+            }
             let Some(key) = name.strip_suffix(".draft") else {
                 continue;
             };
             if !is_safe_key(key) {
                 continue;
             }
-            let saved_at = item.metadata()?.modified()?;
-            let original_path = read_original_path(&self.meta_path(key))?;
+            let saved_at = match item.metadata().and_then(|meta| meta.modified()) {
+                Ok(saved_at) => saved_at,
+                // Discarded after the listing started.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
             entries.push(RecoveryEntry {
                 key: key.to_string(),
-                original_path,
+                original_path: read_original_path(&self.meta_path(key)),
                 saved_at,
             });
+        }
+
+        // A meta without a draft is left by an interrupted discard.
+        for key in meta_keys {
+            if !entries.iter().any(|entry| entry.key == key) {
+                let _ = remove_if_exists(&self.meta_path(&key));
+            }
         }
         entries.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(entries)
@@ -137,6 +173,20 @@ impl Recovery {
         check_key(key)?;
         remove_if_exists(&self.draft_path(key))?;
         remove_if_exists(&self.meta_path(key))
+    }
+
+    /// Creates the recovery dir with mode `0o700` if it is missing.
+    fn ensure_dir(&self) -> io::Result<()> {
+        if self.dir.is_dir() {
+            return Ok(());
+        }
+        if let Some(parent) = self.dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match create_private_dir(&self.dir) {
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists && self.dir.is_dir() => Ok(()),
+            other => other,
+        }
     }
 
     fn draft_path(&self, key: &str) -> PathBuf {
@@ -175,21 +225,77 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Reads `original_path` from a meta file. Missing file or unparseable
-/// content gives `None`. Other I/O errors are returned.
-fn read_original_path(path: &Path) -> io::Result<Option<PathBuf>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(parse_original_path(&text).map(PathBuf::from)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
+/// Reads `original_path` from a meta file. Any failure (missing, unreadable,
+/// unparseable) gives `None`: the draft is then listed as untitled.
+fn read_original_path(path: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(path).ok()?;
+    parse_original_path(&text)
 }
 
-/// Finds the `original_path = "..."` line and unescapes its value.
-fn parse_original_path(text: &str) -> Option<String> {
+/// Contents of a meta file. The lossy path is for people reading the file;
+/// the hex line holds the exact bytes so the path round-trips.
+fn meta_text(path: &Path) -> String {
+    let lossy = escape_toml_string(&path.to_string_lossy());
+    let hex = hex_encode(path.as_os_str().as_encoded_bytes());
+    format!("{META_KEY}\"{lossy}\"\n{META_HEX_KEY}\"{hex}\"\n")
+}
+
+/// The hex line wins when present and valid. Otherwise the lossy line.
+fn parse_original_path(text: &str) -> Option<PathBuf> {
+    let hex_value = text
+        .lines()
+        .find_map(|line| line.strip_prefix(META_HEX_KEY));
+    if let Some(bytes) = hex_value.and_then(unquote).and_then(hex_decode) {
+        if let Some(path) = path_from_bytes(bytes) {
+            return Some(path);
+        }
+    }
     let value = text.lines().find_map(|line| line.strip_prefix(META_KEY))?;
-    let inner = value.trim_end().strip_prefix('"')?.strip_suffix('"')?;
-    unescape_toml_string(inner)
+    let inner = unquote(value.trim_end())?;
+    unescape_toml_string(inner).map(PathBuf::from)
+}
+
+/// The text inside a `"..."` value, or `None`.
+fn unquote(value: &str) -> Option<&str> {
+    value.trim_end().strip_prefix('"')?.strip_suffix('"')
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 || !text.is_ascii() {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Rebuilds a path from its exact bytes. Unix keeps any bytes. Other
+/// platforms need UTF-8.
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
+/// Creates `dir` with mode `0o700` on Unix.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 /// Escapes a value for a TOML basic string (the part between the quotes).
@@ -249,7 +355,7 @@ mod tests {
     fn recovery() -> (tempfile::TempDir, Recovery) {
         let dir = tempfile::tempdir().unwrap();
         // A subfolder: the recovery dir is created on first write.
-        let rec = Recovery::new(dir.path().join("state").join("recovery"));
+        let rec = Recovery::new(dir.path().join("state").join("recovery")).unwrap();
         (dir, rec)
     }
 
@@ -420,6 +526,67 @@ mod tests {
             let escaped = escape_toml_string(value);
             assert_eq!(unescape_toml_string(&escaped).as_deref(), Some(value));
         }
+    }
+
+    #[test]
+    fn meta_that_is_a_directory_lists_as_untitled() {
+        let (_guard, rec) = recovery();
+        let path = PathBuf::from("/notes/a.md");
+        let key = Recovery::key_for_path(&path);
+        rec.write_draft(&key, Some(&path), "body").unwrap();
+        let meta = rec.dir.join(format!("{key}.meta"));
+        fs::remove_file(&meta).unwrap();
+        fs::create_dir(&meta).unwrap();
+
+        let entries = rec.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original_path, None);
+    }
+
+    #[test]
+    fn orphan_meta_is_swept_by_list() {
+        let (_guard, rec) = recovery();
+        rec.write_draft("live", Some(Path::new("/a.md")), "x").unwrap();
+        let orphan = rec.dir.join("orphan.meta");
+        fs::write(&orphan, "original_path = \"/b.md\"\n").unwrap();
+
+        assert_eq!(rec.list().unwrap().len(), 1);
+        assert!(!orphan.exists());
+        assert!(rec.dir.join("live.meta").exists());
+    }
+
+    #[test]
+    fn new_rejects_relative_dir() {
+        assert_eq!(
+            Recovery::new(PathBuf::from("relative/recovery"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_roundtrips() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_guard, rec) = recovery();
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"/notes/caf\xe9.md"));
+        let key = Recovery::key_for_path(&path);
+        rec.write_draft(&key, Some(&path), "body").unwrap();
+        let entries = rec.list().unwrap();
+        assert_eq!(entries[0].original_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, rec) = recovery();
+        rec.write_draft("k3", Some(Path::new("/a.md")), "secret").unwrap();
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(rec.dir.clone()), 0o700);
+        assert_eq!(mode(rec.draft_path("k3")), 0o600);
+        assert_eq!(mode(rec.meta_path("k3")), 0o600);
     }
 
     #[test]
