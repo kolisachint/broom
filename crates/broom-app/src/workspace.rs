@@ -690,7 +690,12 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A closed dialog takes its focused element with it. With nothing open
+        // and nothing focused, hand focus back to the centre editor.
+        if self.dialog.is_none() && self.overlay.is_none() && window.focused(cx).is_none() {
+            cx.defer_in(window, |this, window, cx| this.focus_center(window, cx));
+        }
         let right_visible = !self.zen
             && self
                 .right_panel
