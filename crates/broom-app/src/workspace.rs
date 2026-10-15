@@ -41,6 +41,10 @@ pub struct Workspace {
     pub right: Option<AnyView>,
     /// Editor tabs. The active tab's editor is `center`. Set by `tree_panel::install`.
     pub tabs: Option<Entity<Tabs>>,
+    /// Open overlay (palette, quick open, search, cheatsheet). Drawn on top.
+    pub overlay: Option<AnyView>,
+    /// Keeps the overlay's event subscription alive.
+    pub overlay_sub: Option<Subscription>,
     /// Status bar text. Refreshed from the editor on every edit.
     pub status: SharedString,
     /// Zen mode: panels and status bar hidden, centre column narrowed.
@@ -89,6 +93,8 @@ impl Workspace {
             center,
             right: None,
             tabs: None,
+            overlay: None,
+            overlay_sub: None,
             status: SharedString::default(),
             zen: false,
             settings,
@@ -222,6 +228,7 @@ impl Render for Workspace {
                     .child(self.center_pane())
                     .child(right),
             )
+            .children(self.overlay.clone())
             .children((!self.zen).then(|| {
                 // Status bar: text only, no colour-only meaning.
                 div()

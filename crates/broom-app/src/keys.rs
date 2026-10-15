@@ -114,6 +114,10 @@ impl Workspace {
             Command::ZoomOut => self.zoom_by(-ZOOM_STEP, cx),
             Command::ZoomReset => self.set_font_size(Settings::default().font_size, cx),
             Command::ZenMode => self.toggle_zen(cx),
+            Command::CommandPalette => self.open_palette(window, cx),
+            Command::QuickOpen => self.open_quick_open(window, cx),
+            Command::SearchFolder => self.open_search(window, cx),
+            Command::Cheatsheet => self.open_cheatsheet(window, cx),
             _ => eprintln!("broom: {cmd:?} is not wired yet"),
         }
     }
