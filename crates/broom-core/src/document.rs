@@ -8,9 +8,10 @@
 //!
 //! Undo stores whole block snapshots. That is simple. Optimize only when measured.
 
-use crate::block::{Block, BlockType};
+use crate::block::{Block, BlockKind, BlockType};
 use crate::edit::{EditError, StyleFlag};
 use crate::input_rules::InputRuleOutcome;
+use crate::parse::parse_blocks;
 use crate::pos::{DocPos, DocRange};
 use crate::undo::UndoStack;
 
@@ -27,18 +28,34 @@ pub struct Document {
 impl Document {
     /// A new untitled document with one empty paragraph. Not dirty.
     pub fn empty() -> Document {
-        todo!()
+        Document {
+            blocks: vec![Block {
+                source: String::new(),
+                kind: BlockKind::Paragraph {
+                    content: Vec::new(),
+                },
+                edited: false,
+            }],
+            undo: UndoStack::default(),
+            revision: 0,
+            saved_revision: 0,
+        }
     }
 
     /// Parses markdown. Never fails: unknown syntax becomes an opaque block.
     /// For the parsed document, `to_markdown()` returns `src` byte for byte.
     pub fn parse(src: &str) -> Document {
-        todo!()
+        Document {
+            blocks: parse_blocks(src),
+            undo: UndoStack::default(),
+            revision: 0,
+            saved_revision: 0,
+        }
     }
 
     /// Full markdown: the concatenation of every block's `source()`.
     pub fn to_markdown(&self) -> String {
-        todo!()
+        self.blocks.iter().map(|b| b.source.as_str()).collect()
     }
 
     /// All blocks in document order.
@@ -59,12 +76,16 @@ impl Document {
     /// Visible text of `block`. For opaque blocks this is the raw source.
     /// `None` if the index is invalid.
     pub fn visible_text(&self, block: usize) -> Option<String> {
-        todo!()
+        let b = self.blocks.get(block)?;
+        Some(match &b.kind {
+            BlockKind::Opaque { .. } => b.source.clone(),
+            kind => kind.visible_text(),
+        })
     }
 
     /// Length of `block`'s visible text, in chars. `None` if the index is invalid.
     pub fn visible_len(&self, block: usize) -> Option<usize> {
-        todo!()
+        self.visible_text(block).map(|t| t.chars().count())
     }
 
     /// True if any edit happened since parse or the last [`Document::mark_saved`].
@@ -191,6 +212,75 @@ impl Document {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::block::{BlockKind, OpaqueKind};
+
+    pub(crate) const SAMPLE: &str = "---\ntitle: Test\ntags: [a, b]\n---\n\n# Heading *one*\n\nA paragraph with **bold**, _em_, ~~gone~~, `code`, [a link](https://x.y) and [[Note|alias]].\nSoft break here.\n\n- one\n- two\n  - nested\n\nBetween lists.\n\n- [x] done\n- [ ] todo\n\n1. first\n2. second\n\n> quoted line\n> second quoted\n\n```rust\nfn main() {}\n```\n\n```mermaid\ngraph TD; A-->B\n```\n\n| a | b |\n|:--|--:|\n| 1 | 2 |\n\n---\n\n$$\nx^2 + y^2\n$$\n\n<div>raw html</div>\n\n[^1]: footnote text\n\nInline $x$ math.\n";
+
     #[test]
-    fn placeholder() {}
+    fn round_trip_is_byte_identical() {
+        let doc = Document::parse(SAMPLE);
+        assert_eq!(doc.to_markdown(), SAMPLE);
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn round_trip_edge_inputs() {
+        for src in ["", "\n\n", "   \n", "# only", "foo", "a\n\n\n\nb\n", "[ref]: /url\n\ntext\n", "---\n---\n"] {
+            assert_eq!(Document::parse(src).to_markdown(), src, "input {src:?}");
+        }
+    }
+
+    #[test]
+    fn empty_document_has_one_paragraph() {
+        let doc = Document::empty();
+        assert_eq!(doc.block_count(), 1);
+        assert_eq!(doc.to_markdown(), "");
+        assert_eq!(doc.visible_text(0).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn block_kinds_are_recognized() {
+        let doc = Document::parse(SAMPLE);
+        let kinds: Vec<&BlockKind> = doc.blocks().iter().map(|b| b.kind()).collect();
+        assert!(matches!(kinds[0], BlockKind::FrontMatter { yaml } if yaml == "title: Test\ntags: [a, b]"));
+        assert!(matches!(kinds[1], BlockKind::Heading { level: 1, .. }));
+        assert!(matches!(kinds[2], BlockKind::Paragraph { .. }));
+        assert!(matches!(kinds[3], BlockKind::List { ordered: false, items } if items.len() == 3 && items[2].depth == 1));
+        assert!(matches!(kinds[4], BlockKind::Paragraph { .. }));
+        assert!(matches!(kinds[5], BlockKind::TaskList { items } if items.len() == 2 && items[0].checked == Some(true)));
+        assert!(matches!(kinds[6], BlockKind::List { ordered: true, .. }));
+        assert!(matches!(kinds[7], BlockKind::BlockQuote { children } if children.len() == 1));
+        assert!(matches!(kinds[8], BlockKind::CodeBlock { lang, text } if lang.as_deref() == Some("rust") && text == "fn main() {}"));
+        assert!(matches!(kinds[9], BlockKind::CodeBlock { lang, .. } if lang.as_deref() == Some("mermaid")));
+        assert!(matches!(kinds[10], BlockKind::Table { alignments, .. } if alignments.len() == 2));
+        assert!(matches!(kinds[11], BlockKind::ThematicBreak));
+        assert!(matches!(kinds[12], BlockKind::MathBlock { tex } if tex == "x^2 + y^2"));
+        assert!(matches!(kinds[13], BlockKind::Opaque { kind: OpaqueKind::Html }));
+        assert!(matches!(kinds[14], BlockKind::Opaque { kind: OpaqueKind::FootnoteDefinition }));
+        assert!(matches!(kinds[15], BlockKind::Paragraph { .. }));
+    }
+
+    #[test]
+    fn inline_runs_carry_styles() {
+        let doc = Document::parse("A **b** _c_ ~~d~~ `e` [f](u) [[Note|alias]] $g$.\n");
+        let BlockKind::Paragraph { content } = doc.block(0).unwrap().kind() else {
+            panic!("expected paragraph");
+        };
+        let find = |t: &str| content.iter().find(|r| r.text == t).unwrap_or_else(|| panic!("no run {t}"));
+        assert!(find("b").style.bold);
+        assert!(find("c").style.italic);
+        assert!(find("d").style.strike);
+        assert!(find("e").style.code);
+        assert_eq!(find("f").style.link.as_deref(), Some("u"));
+        assert_eq!(find("alias").style.wikilink.as_ref().unwrap().target, "Note");
+        assert!(find("g").style.math);
+    }
+
+    #[test]
+    fn visible_text_is_markup_free() {
+        let doc = Document::parse("# Title **x**\n\n- a\n- [ ] b\n");
+        assert_eq!(doc.visible_text(0).as_deref(), Some("Title x"));
+        assert_eq!(doc.visible_text(1).as_deref(), Some("a\nb"));
+    }
 }
