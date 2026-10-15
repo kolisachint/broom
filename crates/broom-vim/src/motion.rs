@@ -118,22 +118,31 @@ pub fn apply(motion: Motion, count: usize, buf: &dyn VimBuffer) -> Cursor {
         },
         Motion::Right => Cursor {
             line: cur.line,
-            col: (cur.col + n).min(buf.line_len(cur.line)),
+            col: cur.col.saturating_add(n).min(buf.line_len(cur.line)),
         },
         Motion::Up | Motion::Down => {
             let line = if motion == Motion::Up {
                 cur.line.saturating_sub(n)
             } else {
-                (cur.line + n).min(last)
+                cur.line.saturating_add(n).min(last)
             };
             Cursor {
                 line,
                 col: cur.col.min(buf.line_len(line)),
             }
         }
-        Motion::WordForward { big } => repeat(n, cur, |p| word_forward(buf, p, big)),
-        Motion::WordBack { big } => repeat(n, cur, |p| word_back(buf, p, big)),
-        Motion::WordEnd { big } => repeat(n, cur, |p| word_end(buf, p, big)),
+        Motion::WordForward { big } => {
+            let mut t = Text::new(buf);
+            repeat(n, cur, |p| word_forward(&mut t, p, big))
+        }
+        Motion::WordBack { big } => {
+            let mut t = Text::new(buf);
+            repeat(n, cur, |p| word_back(&mut t, p, big))
+        }
+        Motion::WordEnd { big } => {
+            let mut t = Text::new(buf);
+            repeat(n, cur, |p| word_end(&mut t, p, big))
+        }
         Motion::LineStart => Cursor {
             line: cur.line,
             col: 0,
@@ -143,7 +152,7 @@ pub fn apply(motion: Motion, count: usize, buf: &dyn VimBuffer) -> Cursor {
             col: first_nonblank(buf, cur.line),
         },
         Motion::LineEnd => {
-            let line = (cur.line + n - 1).min(last);
+            let line = cur.line.saturating_add(n - 1).min(last);
             Cursor {
                 line,
                 col: buf.line_len(line).saturating_sub(1),
@@ -156,9 +165,11 @@ pub fn apply(motion: Motion, count: usize, buf: &dyn VimBuffer) -> Cursor {
                 col: first_nonblank(buf, line),
             }
         }
-        Motion::Find(f) => find_char(buf, cur, f, n).unwrap_or(cur),
+        Motion::Find(f) => find_char(buf, cur, f, n, false).unwrap_or(cur),
         Motion::RepeatFind { find, reverse } => {
-            find_char(buf, cur, repeat_find(find, reverse), n).unwrap_or(cur)
+            let f = repeat_find(find, reverse);
+            let skip = f.till && adjacent_match(buf, cur, f);
+            find_char(buf, cur, f, n, skip).unwrap_or(cur)
         }
         Motion::NextHeading | Motion::PrevHeading => {
             let forward = motion == Motion::NextHeading;
@@ -178,7 +189,7 @@ pub fn apply(motion: Motion, count: usize, buf: &dyn VimBuffer) -> Cursor {
     }
 }
 
-fn repeat(n: usize, start: Cursor, step: impl Fn(Cursor) -> Cursor) -> Cursor {
+fn repeat(n: usize, start: Cursor, mut step: impl FnMut(Cursor) -> Cursor) -> Cursor {
     (0..n).fold(start, |p, _| step(p))
 }
 
@@ -194,51 +205,82 @@ pub(crate) fn char_class(c: char, big: bool) -> u8 {
     }
 }
 
-fn class_at(buf: &dyn VimBuffer, p: Cursor, big: bool) -> u8 {
-    let line = buf.line(p.line).unwrap_or_default();
-    line.chars().nth(p.col).map_or(0, |c| char_class(c, big))
+// Caches the chars of one line, so word motions do not re-read it per step.
+struct Text<'a> {
+    buf: &'a dyn VimBuffer,
+    line: usize,
+    chars: Vec<char>,
+    lines: usize,
 }
 
-// Steps one position forward. The line end is a position (col == len).
-fn next_pos(buf: &dyn VimBuffer, p: Cursor) -> Option<Cursor> {
-    if p.col < buf.line_len(p.line) {
-        Some(Cursor {
-            line: p.line,
-            col: p.col + 1,
-        })
-    } else if p.line + 1 < buf.line_count() {
-        Some(Cursor {
-            line: p.line + 1,
-            col: 0,
-        })
-    } else {
-        None
+impl<'a> Text<'a> {
+    fn new(buf: &'a dyn VimBuffer) -> Text<'a> {
+        Text {
+            buf,
+            line: usize::MAX,
+            chars: Vec::new(),
+            lines: buf.line_count(),
+        }
     }
-}
 
-// Steps one position back. Going back onto a line lands on its line end.
-fn prev_pos(buf: &dyn VimBuffer, p: Cursor) -> Option<Cursor> {
-    if p.col > 0 {
-        Some(Cursor {
-            line: p.line,
-            col: p.col - 1,
-        })
-    } else if p.line > 0 {
-        let line = p.line - 1;
-        Some(Cursor {
+    fn load(&mut self, line: usize) {
+        if line != self.line {
+            self.chars = self.buf.line(line).unwrap_or_default().chars().collect();
+            self.line = line;
+        }
+    }
+
+    fn len(&mut self, line: usize) -> usize {
+        self.load(line);
+        self.chars.len()
+    }
+
+    fn class(&mut self, p: Cursor, big: bool) -> u8 {
+        self.load(p.line);
+        self.chars.get(p.col).map_or(0, |c| char_class(*c, big))
+    }
+
+    // Steps one position forward. The line end is a position (col == len).
+    fn next(&mut self, p: Cursor) -> Option<Cursor> {
+        if p.col < self.len(p.line) {
+            Some(Cursor {
+                line: p.line,
+                col: p.col + 1,
+            })
+        } else if p.line + 1 < self.lines {
+            Some(Cursor {
+                line: p.line + 1,
+                col: 0,
+            })
+        } else {
+            None
+        }
+    }
+
+    // Steps one position back. Going back onto a line lands on its line end.
+    fn prev(&mut self, p: Cursor) -> Option<Cursor> {
+        if p.col > 0 {
+            Some(Cursor {
+                line: p.line,
+                col: p.col - 1,
+            })
+        } else if p.line > 0 {
+            let line = p.line - 1;
+            Some(Cursor {
+                line,
+                col: self.len(line),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn end_of_buffer(&mut self) -> Cursor {
+        let line = self.lines.saturating_sub(1);
+        Cursor {
             line,
-            col: buf.line_len(line),
-        })
-    } else {
-        None
-    }
-}
-
-fn end_of_buffer(buf: &dyn VimBuffer) -> Cursor {
-    let line = buf.line_count().saturating_sub(1);
-    Cursor {
-        line,
-        col: buf.line_len(line),
+            col: self.len(line),
+        }
     }
 }
 
@@ -248,19 +290,19 @@ pub(crate) fn first_nonblank(buf: &dyn VimBuffer, line: usize) -> usize {
 }
 
 // Stops at the first char of a different class, or on an empty line.
-fn word_forward(buf: &dyn VimBuffer, p: Cursor, big: bool) -> Cursor {
-    let start = class_at(buf, p, big);
+fn word_forward(t: &mut Text, p: Cursor, big: bool) -> Cursor {
+    let start = t.class(p, big);
     let mut q = p;
     let mut seen_blank = start == 0;
     loop {
-        let Some(n) = next_pos(buf, q) else {
-            return end_of_buffer(buf);
+        let Some(n) = t.next(q) else {
+            return t.end_of_buffer();
         };
         q = n;
-        if buf.line_len(q.line) == 0 {
+        if t.len(q.line) == 0 {
             return q;
         }
-        let c = class_at(buf, q, big);
+        let c = t.class(q, big);
         if c == 0 {
             seen_blank = true;
         } else if c != start || seen_blank {
@@ -270,23 +312,23 @@ fn word_forward(buf: &dyn VimBuffer, p: Cursor, big: bool) -> Cursor {
 }
 
 // Skips blanks back, then goes to the start of the word found.
-fn word_back(buf: &dyn VimBuffer, p: Cursor, big: bool) -> Cursor {
+fn word_back(t: &mut Text, p: Cursor, big: bool) -> Cursor {
     let mut q = p;
     loop {
-        let Some(n) = prev_pos(buf, q) else {
+        let Some(n) = t.prev(q) else {
             return Cursor::default();
         };
         q = n;
-        if buf.line_len(q.line) == 0 || class_at(buf, q, big) != 0 {
+        if t.len(q.line) == 0 || t.class(q, big) != 0 {
             break;
         }
     }
-    if buf.line_len(q.line) == 0 {
+    if t.len(q.line) == 0 {
         return q;
     }
-    let c = class_at(buf, q, big);
-    while let Some(n) = prev_pos(buf, q) {
-        if class_at(buf, n, big) != c {
+    let c = t.class(q, big);
+    while let Some(n) = t.prev(q) {
+        if t.class(n, big) != c {
             break;
         }
         q = n;
@@ -295,20 +337,20 @@ fn word_back(buf: &dyn VimBuffer, p: Cursor, big: bool) -> Cursor {
 }
 
 // Skips blanks forward, then goes to the end of the word found.
-fn word_end(buf: &dyn VimBuffer, p: Cursor, big: bool) -> Cursor {
+fn word_end(t: &mut Text, p: Cursor, big: bool) -> Cursor {
     let mut q = p;
     loop {
-        let Some(n) = next_pos(buf, q) else {
-            return end_of_buffer(buf);
+        let Some(n) = t.next(q) else {
+            return t.end_of_buffer();
         };
         q = n;
-        if class_at(buf, q, big) != 0 {
+        if t.class(q, big) != 0 {
             break;
         }
     }
-    let c = class_at(buf, q, big);
-    while let Some(n) = next_pos(buf, q) {
-        if class_at(buf, n, big) != c {
+    let c = t.class(q, big);
+    while let Some(n) = t.next(q) {
+        if t.class(n, big) != c {
             break;
         }
         q = n;
@@ -316,15 +358,29 @@ fn word_end(buf: &dyn VimBuffer, p: Cursor, big: bool) -> Cursor {
     q
 }
 
+// True when the char next to the cursor in the search direction is `f.ch`.
+fn adjacent_match(buf: &dyn VimBuffer, cur: Cursor, f: Find) -> bool {
+    let col = if f.forward {
+        Some(cur.col.saturating_add(1))
+    } else {
+        cur.col.checked_sub(1)
+    };
+    let ch = col.and_then(|c| buf.line(cur.line)?.chars().nth(c));
+    ch == Some(f.ch)
+}
+
 // Finds the n-th match on the cursor's line. `None` when there are too few.
-fn find_char(buf: &dyn VimBuffer, cur: Cursor, f: Find, n: usize) -> Option<Cursor> {
+// `skip` ignores the nearest match, so `;` after `t` moves on.
+fn find_char(buf: &dyn VimBuffer, cur: Cursor, f: Find, n: usize, skip: bool) -> Option<Cursor> {
     let chars: Vec<char> = buf.line(cur.line)?.chars().collect();
+    let skip = usize::from(skip);
     let mut remaining = n;
     let mut hit = None;
     let order: Box<dyn Iterator<Item = usize>> = if f.forward {
-        Box::new(cur.col + 1..chars.len())
+        Box::new(cur.col.saturating_add(1 + skip)..chars.len())
     } else {
-        Box::new((0..cur.col.min(chars.len())).rev())
+        let end = cur.col.min(chars.len()).saturating_sub(skip);
+        Box::new((0..end).rev())
     };
     for i in order {
         if chars[i] == f.ch {
@@ -518,5 +574,21 @@ mod tests {
             till: false,
         };
         assert_eq!(Motion::Find(back).kind(), MotionKind::Exclusive);
+    }
+
+    #[test]
+    fn repeat_till_skips_adjacent_match() {
+        let text = "a,b,c";
+        let t = Find { ch: ',', forward: true, till: true };
+        let b = at(text, 0, 0);
+        assert_eq!(apply(Motion::Find(t), 1, &b), pos(0, 0));
+        let mut b = at(text, 0, 0);
+        b.set_cursor(pos(0, 0));
+        let next = Motion::RepeatFind { find: t, reverse: false };
+        assert_eq!(apply(next, 1, &b), pos(0, 2));
+        let back = Find { ch: 'a', forward: false, till: true };
+        let b = at("abcd", 0, 3);
+        let prev = Motion::RepeatFind { find: back, reverse: false };
+        assert_eq!(apply(prev, 1, &b), pos(0, 1));
     }
 }

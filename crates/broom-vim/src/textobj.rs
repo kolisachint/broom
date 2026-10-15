@@ -126,11 +126,35 @@ fn quote_range(q: char, around: bool, buf: &dyn VimBuffer, cur: Cursor) -> Optio
         .filter(|(_, c)| **c == q)
         .map(|(i, _)| i)
         .collect();
-    let pair = marks
+    // The pair holding the cursor, else the first pair after it.
+    let pairs: Vec<(usize, usize)> = marks
         .chunks(2)
-        .find(|p| p.len() == 2 && p[0] <= cur.col && cur.col <= p[1])?;
-    let (s, e) = (pair[0], pair[1]);
-    let (start, end) = if around { (s, e + 1) } else { (s + 1, e) };
+        .filter(|p| p.len() == 2)
+        .map(|p| (p[0], p[1]))
+        .collect();
+    let (s, e) = pairs
+        .iter()
+        .copied()
+        .find(|&(s, e)| s <= cur.col && cur.col <= e)
+        .or_else(|| pairs.iter().copied().find(|&(s, _)| s > cur.col))?;
+    let (start, end) = if around {
+        // `a"` takes the blanks after the closing quote, or before the opening one.
+        let mut after = e + 1;
+        while after < chars.len() && chars[after].is_whitespace() {
+            after += 1;
+        }
+        if after > e + 1 {
+            (s, after)
+        } else {
+            let mut before = s;
+            while before > 0 && chars[before - 1].is_whitespace() {
+                before -= 1;
+            }
+            (before, e + 1)
+        }
+    } else {
+        (s + 1, e)
+    };
     Some(span(
         Cursor {
             line: cur.line,
@@ -306,11 +330,21 @@ mod tests {
         );
         assert_eq!(
             cols(get(TextObject::Quote('"'), true, text, 0, 6)),
-            Some((pos(0, 4), pos(0, 14)))
+            Some((pos(0, 4), pos(0, 15)))
         );
         assert_eq!(
             cols(get(TextObject::Quote('"'), false, "no quotes", 0, 2)),
             None
+        );
+        // Cursor before the first quote searches forward on the line.
+        assert_eq!(
+            cols(get(TextObject::Quote('"'), false, "x \"ab\"", 0, 0)),
+            Some((pos(0, 3), pos(0, 5)))
+        );
+        // No trailing blank: take the leading one.
+        assert_eq!(
+            cols(get(TextObject::Quote('"'), true, "x \"hi\"", 0, 3)),
+            Some((pos(0, 1), pos(0, 6)))
         );
     }
 
