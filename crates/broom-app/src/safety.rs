@@ -4,7 +4,13 @@
 //! Every library call goes through [`guarded`], so a `todo!()` stub in
 //! broom-fs disables that part and never stops the window. Each field is an
 //! `Option` for the same reason.
+//!
+//! Conflict stamps are per path. A stamp is taken only when broom reads a
+//! file into a buffer ([`read_stamped`]) or writes one, never when a tab is
+//! just shown again. Drafts are per tab: each tab has its own draft key.
 
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
@@ -25,9 +31,15 @@ pub struct Safety {
     watcher: Option<Watcher>,
     events: Option<Receiver<WatchEvent>>,
     watched_dir: Option<PathBuf>,
-    /// Key of the current buffer's draft. Named files use the path hash.
-    draft_key: String,
     last_draft: Instant,
+}
+
+/// Reads a file and its mtime. The mtime is taken before the read, so a
+/// write that lands during the read still differs from the stamp.
+pub fn read_stamped(path: &Path) -> io::Result<(Option<SystemTime>, String)> {
+    let mtime = fs::metadata(path)?.modified().ok();
+    let text = fs::read_to_string(path)?;
+    Ok((mtime, text))
 }
 
 impl Safety {
@@ -40,7 +52,10 @@ impl Safety {
         let conflicts = guarded("conflict check", ConflictDetector::new);
         let recovery = recovery_dir
             .and_then(|dir| guarded("recovery", || Recovery::new(dir)))
-            .and_then(|r| r.map_err(|e| eprintln!("broom: recovery unavailable: {e}")).ok());
+            .and_then(|r| {
+                r.map_err(|e| eprintln!("broom: recovery unavailable: {e}"))
+                    .ok()
+            });
         let (watcher, events) = guarded("file watcher", Watcher::new)
             .and_then(Result::ok)
             .map_or((None, None), |(w, rx)| (Some(w), Some(rx)));
@@ -51,24 +66,25 @@ impl Safety {
             watcher,
             events,
             watched_dir: None,
-            draft_key: guarded("recovery key", Recovery::new_untitled_key)
-                .unwrap_or_else(|| "untitled".into()),
             last_draft: Instant::now(),
         }
     }
 
-    /// Switches to a new buffer. `path` is `None` for untitled. Records the
-    /// disk stamp for `path` and watches its folder for changes.
-    pub fn set_buffer(&mut self, path: Option<&Path>, contents: &str) {
-        self.draft_key = match path {
-            Some(p) => guarded("recovery key", || Recovery::key_for_path(p)),
-            None => guarded("recovery key", Recovery::new_untitled_key),
-        }
-        .unwrap_or_else(|| self.draft_key.clone());
+    /// Draft key for a named file. The same path always gives the same key.
+    pub fn draft_key_for_path(path: &Path) -> String {
+        guarded("recovery key", || Recovery::key_for_path(path))
+            .unwrap_or_else(|| "unavailable".into())
+    }
+
+    /// Fresh draft key for an untitled buffer. Unique per call.
+    pub fn untitled_key() -> String {
+        guarded("recovery key", Recovery::new_untitled_key).unwrap_or_else(|| "untitled".into())
+    }
+
+    /// Watches the folder of the open file for outside changes. Does not
+    /// stamp the file: a stamp only comes from a read or a write.
+    pub fn watch_buffer(&mut self, path: Option<&Path>) {
         if let Some(p) = path {
-            if let Some(d) = self.conflicts.as_mut() {
-                let _ = guarded("conflict record", || d.record(p, contents));
-            }
             self.watch_dir(p.parent().map(Path::to_path_buf));
         }
     }
@@ -144,15 +160,9 @@ impl Safety {
         self.external_change(p)
     }
 
-    /// Stamps `path` with what broom just read.
-    pub fn record(&mut self, path: &Path, contents: &str) {
-        if let Some(d) = self.conflicts.as_mut() {
-            let _ = guarded("conflict record", || d.record(path, contents));
-        }
-    }
-
-    /// Stamps `path` after our own save. `mtime` comes from
-    /// `write_atomic_stamped`, so a later external write still shows as a conflict.
+    /// Stamps `path` with an mtime and the bytes broom holds for it. Use the
+    /// mtime from [`read_stamped`] (taken before the read) or from
+    /// `write_atomic_stamped` (taken from the written handle).
     pub fn record_stamp(&mut self, path: &Path, mtime: Option<SystemTime>, bytes: &[u8]) {
         if let Some(d) = self.conflicts.as_mut() {
             guarded("conflict record", || d.record_stamp(path, mtime, bytes));
@@ -168,19 +178,17 @@ impl Safety {
         true
     }
 
-    /// Writes the draft for the current buffer.
-    pub fn write_draft(&self, path: Option<&Path>, contents: &str) {
+    /// Writes the draft for one buffer. `key` is that tab's draft key.
+    pub fn write_draft(&self, key: &str, path: Option<&Path>, contents: &str) {
         if let Some(r) = self.recovery.as_ref() {
-            let _ = guarded("recovery", || {
-                r.write_draft(&self.draft_key, path, contents)
-            });
+            let _ = guarded("recovery", || r.write_draft(key, path, contents));
         }
     }
 
-    /// Deletes the current buffer's draft after a save or discard.
-    pub fn discard_draft(&self) {
+    /// Deletes a draft by key after a save, a discard, or a restore.
+    pub fn discard_draft(&self, key: &str) {
         if let Some(r) = self.recovery.as_ref() {
-            let _ = guarded("recovery", || r.discard(&self.draft_key));
+            let _ = guarded("recovery", || r.discard(key));
         }
     }
 
@@ -197,12 +205,5 @@ impl Safety {
     pub fn read_draft(&self, key: &str) -> Option<String> {
         let r = self.recovery.as_ref()?;
         guarded("recovery", || r.read_draft(key)).and_then(Result::ok)
-    }
-
-    /// Deletes a draft by key (used for recovery entries, not the open buffer).
-    pub fn discard_key(&self, key: &str) {
-        if let Some(r) = self.recovery.as_ref() {
-            let _ = guarded("recovery", || r.discard(key));
-        }
     }
 }

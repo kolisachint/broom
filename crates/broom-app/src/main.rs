@@ -67,12 +67,20 @@ fn main() {
                 ..Default::default()
             };
 
-            gpui_kit::open_window(options, cx, move |window, cx| {
+            let (_, ws) = gpui_kit::open_window(options, cx, move |window, cx| {
                 let ws = cx.new(|cx| Workspace::new(folder, cx));
                 keys::focus_editor(&ws, window, cx);
                 ws
             })
             .expect("failed to open the broom window");
+
+            // Quit keeps every edit: dirty named tabs are saved, all dirty tabs drafted.
+            let quit_ws = ws.clone();
+            cx.on_app_quit(move |cx| {
+                quit_ws.update(cx, |ws, cx| ws.flush_on_quit(cx));
+                async {}
+            })
+            .detach();
 
             cx.activate(true);
         });

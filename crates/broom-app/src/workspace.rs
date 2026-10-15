@@ -15,8 +15,8 @@
 //! - [ ] conflict and large-file warning bars above the centre editor
 //! - [ ] autosave and recovery wiring (`broom-fs::autosave`, `recovery`)
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use broom_config::{Settings, VimBindings, settings_path};
 use broom_core::Document;
@@ -25,12 +25,12 @@ use broom_links::LinkIndex;
 use gpui_kit::*;
 
 use crate::dialogs::{Dialog, DialogEvent, DialogKind};
-use crate::editor::{Editor, EditorEvent, EditorStyle, ViewMode};
+use crate::editor::{Editor, EditorStyle, ViewMode};
 use crate::keys::Run;
 use crate::right_panel::{RightPanel, RightPanelEvent, backlink_rows};
-use crate::safety::Safety;
+use crate::safety::{Safety, read_stamped};
 use crate::status_bar::{self, SaveState, StatusInfo};
-use crate::tabs::Tabs;
+use crate::tabs::{TabRef, Tabs, autosave_ids};
 use crate::theme;
 use crate::tree_panel::TreeView;
 use crate::zen;
@@ -102,15 +102,8 @@ impl Workspace {
         })
         .map(|editor| cx.new(|_| editor));
 
+        // Edits in the centre editor are watched by `Tabs`, one subscription per tab.
         let mut subs = Vec::new();
-        if let Some(editor) = &center {
-            subs.push(cx.subscribe(editor, |this, _, event: &EditorEvent, cx| {
-                if matches!(event, EditorEvent::Edited) {
-                    this.on_edited(cx);
-                }
-                cx.notify();
-            }));
-        }
         let right_panel = cx.new(|_| RightPanel::new(settings.show_right_panel));
         subs.push(
             cx.subscribe(&right_panel, |this, _, event: &RightPanelEvent, cx| {
@@ -153,6 +146,10 @@ impl Workspace {
             _ticker: Some(ticker),
         };
         crate::tree_panel::install(&mut ws, cx);
+        if let (Some(tabs), Some(editor)) = (ws.tabs.clone(), ws.center.clone()) {
+            let key = Safety::untitled_key();
+            tabs.update(cx, |tabs, cx| tabs.push_initial(editor, key, cx));
+        }
         ws.recovery_queue = ws.safety.recoverable();
         ws.show_next_recovery(cx);
         ws.refresh_status(cx);
@@ -263,81 +260,171 @@ impl Workspace {
         self.refresh_panels(cx);
     }
 
-    /// Makes `path` the open file. `disk` is what the file holds on disk
-    /// now, so the conflict check compares against the right stamp. The
-    /// caller sets the editor text (see [`Self::open_file`]).
-    pub fn attach(&mut self, path: Option<PathBuf>, disk: &str) {
-        self.safety.set_buffer(path.as_deref(), disk);
-        self.path = path;
+    /// Opens `path` as a tab (see [`Tabs::open`]). Deferred, because the tab
+    /// strip calls back into this workspace.
+    pub fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.with_tabs(cx, move |tabs, cx| tabs.open(&path, true, cx));
     }
 
-    /// Opens a file as a tab. Markdown gets an editor tab; other files go to
-    /// the macOS default app. Each tab keeps its own editor, so a dirty tab
-    /// is not saved when another file opens.
-    pub fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        // Tabs call back into this workspace, so the open runs after this update.
+    /// Runs `f` on the tab strip after this update. Tab changes call back
+    /// into the workspace, which is locked during its own update.
+    fn with_tabs(
+        &self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Tabs, &mut Context<Tabs>) + 'static,
+    ) {
         if let Some(tabs) = self.tabs.clone() {
-            cx.defer(move |cx| tabs.update(cx, |tabs, cx| tabs.open(&path, true, cx)));
+            cx.defer(move |cx| tabs.update(cx, f));
         }
     }
 
+    /// The active tab (key, path, editor), if any.
+    fn active_tab(&self, cx: &App) -> Option<TabRef> {
+        self.tabs.as_ref()?.read(cx).active_ref()
+    }
+
     /// Makes the active tab's editor and file the current ones. Called by
-    /// `Tabs` on every switch, open and close.
+    /// `Tabs` on every switch, open and close. Reads nothing from disk: the
+    /// conflict stamp was set when the file was read into its tab.
     pub(crate) fn adopt(
         &mut self,
         editor: Option<Entity<Editor>>,
         path: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        match &path {
-            Some(p) => {
-                let disk = std::fs::read_to_string(p).unwrap_or_default();
-                self.attach(Some(p.clone()), &disk);
-            }
-            None => self.path = None,
-        }
+        self.safety.watch_buffer(path.as_deref());
+        self.path = path;
         self.center = editor;
         self.refresh_status(cx);
         self.refresh_panels(cx);
     }
 
-    /// Writes the buffer to its file. `force` skips the external-change
-    /// check. Untitled buffers are not saved (no save-as yet).
+    /// Stamps a file that `Tabs` just read into a buffer.
+    pub(crate) fn stamp_read(&mut self, path: &Path, mtime: Option<SystemTime>, bytes: &[u8]) {
+        self.safety.record_stamp(path, mtime, bytes);
+    }
+
+    /// Saves the active buffer. Cmd+S on an untitled buffer asks for a file
+    /// name. `force` skips the external-change check.
     pub fn save(&mut self, force: bool, cx: &mut Context<Self>) {
-        let (Some(path), Some(editor)) = (self.path.clone(), self.center.clone()) else {
+        let Some(tab) = self.active_tab(cx) else {
             return;
         };
-        if !force && self.safety.external_change(&path).is_some() {
+        match tab.path.clone() {
+            Some(path) => {
+                self.write_to(&path, &tab.key, &tab.editor, force, cx);
+            }
+            None => self.save_as(tab.key, false, cx),
+        }
+    }
+
+    /// Writes `editor` to `path` and clears the draft at `key`. Returns true
+    /// on success. Without `force`, an external change opens the conflict
+    /// dialog instead and returns false.
+    fn write_to(
+        &mut self,
+        path: &Path,
+        key: &str,
+        editor: &Entity<Editor>,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !force && self.safety.external_change(path).is_some() {
             self.show_dialog(
                 DialogKind::Conflict {
-                    path,
+                    path: path.to_path_buf(),
                     kind: ConflictKind::Modified,
                 },
                 cx,
             );
-            return;
+            return false;
         }
         let md = editor.read(cx).markdown();
-        match guarded("save", || broom_fs::write_atomic_stamped(&path, md.as_bytes())) {
+        match guarded("save", || {
+            broom_fs::write_atomic_stamped(path, md.as_bytes())
+        }) {
             Some(Ok(mtime)) => {
-                self.safety.record_stamp(&path, mtime, md.as_bytes());
-                self.safety.cancel_save(&path);
-                self.safety.discard_draft();
+                self.safety.record_stamp(path, mtime, md.as_bytes());
+                self.safety.cancel_save(path);
+                self.safety.discard_draft(key);
                 if let Some(index) = self.links.as_mut() {
-                    let _ = guarded("link index", || index.update_file(&path, &md));
+                    let _ = guarded("link index", || index.update_file(path, &md));
                 }
                 editor.update(cx, |ed, _| ed.mark_saved());
-                if self.conflict_open(cx) {
-                    self.dialog = None;
-                    self.dialog_sub = None;
+                if self.conflict_for(path, cx) {
+                    self.close_dialog(cx);
                 }
                 self.refresh_status(cx);
                 self.refresh_panels(cx);
+                true
             }
-            Some(Err(err)) => eprintln!("broom: save failed: {err}"),
-            None => {}
+            Some(Err(err)) => {
+                eprintln!("broom: save failed: {err}");
+                false
+            }
+            None => false,
         }
-        self.refresh_status(cx);
+    }
+
+    /// Asks for a file name, then saves the untitled tab `key` there.
+    /// `then_close` removes the tab after a good save (close prompt).
+    fn save_as(&mut self, key: String, then_close: bool, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_new_path(&self.folder, Some("Untitled.md"));
+        cx.spawn(async move |this: WeakEntity<Workspace>, cx| {
+            let Ok(Ok(Some(path))) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |ws, cx| ws.finish_save_as(&key, path, then_close, cx));
+        })
+        .detach();
+    }
+
+    fn finish_save_as(
+        &mut self,
+        key: &str,
+        path: PathBuf,
+        then_close: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.as_ref().and_then(|t| t.read(cx).ref_by_key(key)) else {
+            return;
+        };
+        if !self.write_to(&path, key, &tab.editor, true, cx) {
+            return;
+        }
+        let key = key.to_string();
+        self.with_tabs(cx, move |tabs, cx| {
+            if then_close {
+                tabs.remove_key(&key, cx);
+            } else {
+                tabs.set_path(&key, path, cx);
+            }
+        });
+    }
+
+    /// Saves one tab from the close prompt, then closes it. Returns true when
+    /// the prompt can close.
+    fn save_tab(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.tabs.as_ref().and_then(|t| t.read(cx).ref_by_key(key)) else {
+            return true;
+        };
+        let Some(path) = tab.path.clone() else {
+            self.save_as(key.to_string(), true, cx);
+            return true;
+        };
+        // Conflict dialogs act on the active tab, so make this one active.
+        let k = key.to_string();
+        self.with_tabs(cx, move |tabs, cx| {
+            if let Some(idx) = tabs.index_of_key(&k) {
+                tabs.activate(idx, cx);
+            }
+        });
+        if !self.write_to(&path, key, &tab.editor, false, cx) {
+            return false;
+        }
+        let k = key.to_string();
+        self.with_tabs(cx, move |tabs, cx| tabs.remove_key(&k, cx));
+        true
     }
 
     /// Periodic work: autosave, disk changes, and recovery drafts.
@@ -351,24 +438,72 @@ impl Workspace {
             };
             self.show_dialog(kind, cx);
         }
-        for due in self.safety.due_saves() {
-            if self.path.as_deref() == Some(due.as_path()) && !self.conflict_open(cx) {
-                self.save(false, cx);
+        let Some(tabs) = self.tabs.clone() else {
+            return;
+        };
+        let refs = tabs.read(cx).refs();
+        let rows: Vec<(u64, Option<PathBuf>, bool)> = refs
+            .iter()
+            .map(|t| (t.id, t.path.clone(), t.editor.read(cx).is_dirty()))
+            .collect();
+        let due = self.safety.due_saves();
+        for id in autosave_ids(&rows, &due) {
+            let Some(tab) = refs.iter().find(|t| t.id == id) else {
+                continue;
+            };
+            let Some(path) = tab.path.clone() else {
+                continue;
+            };
+            if self.conflict_open(cx) {
+                break;
+            }
+            // A background tab with an outside change is left alone. Its draft
+            // is still kept, and the user sees the change when it is active.
+            if self.path.as_deref() != Some(path.as_path())
+                && self.safety.external_change(&path).is_some()
+            {
+                continue;
+            }
+            self.write_to(&path, &tab.key, &tab.editor, false, cx);
+        }
+        if self.safety.draft_due() {
+            for tab in &refs {
+                let ed = tab.editor.read(cx);
+                if ed.is_dirty() {
+                    let md = ed.markdown();
+                    self.safety.write_draft(&tab.key, tab.path.as_deref(), &md);
+                }
             }
         }
-        let dirty = self.center.as_ref().is_some_and(|e| e.read(cx).is_dirty());
-        if dirty
-            && self.safety.draft_due()
-            && let Some(editor) = &self.center
-        {
-            let md = editor.read(cx).markdown();
-            self.safety.write_draft(self.path.as_deref(), &md);
+    }
+
+    /// Writes every dirty named tab and drafts every dirty tab. Runs on app quit.
+    pub fn flush_on_quit(&mut self, cx: &mut Context<Self>) {
+        let Some(tabs) = self.tabs.clone() else {
+            return;
+        };
+        for tab in tabs.read(cx).refs() {
+            if !tab.editor.read(cx).is_dirty() {
+                continue;
+            }
+            let md = tab.editor.read(cx).markdown();
+            self.safety.write_draft(&tab.key, tab.path.as_deref(), &md);
+            if let Some(path) = tab.path.clone()
+                && self.safety.external_change(&path).is_none()
+            {
+                self.write_to(&path, &tab.key, &tab.editor, false, cx);
+            }
         }
+    }
+
+    /// Asks before a dirty tab closes. Called by `Tabs::close_at`.
+    pub(crate) fn ask_close(&mut self, key: String, name: String, cx: &mut Context<Self>) {
+        self.show_dialog(DialogKind::Unsaved { key, name }, cx);
     }
 
     /// Opens a dialog over the window.
     fn show_dialog(&mut self, kind: DialogKind, cx: &mut Context<Self>) {
-        let dialog = cx.new(|_| Dialog::new(kind));
+        let dialog = cx.new(|cx| Dialog::new(kind, cx));
         self.dialog_sub = Some(cx.subscribe(&dialog, |this, _, event: &DialogEvent, cx| {
             this.on_dialog(event.clone(), cx);
         }));
@@ -394,13 +529,20 @@ impl Workspace {
         let done = match event {
             DialogEvent::Reload => self.reload(cx),
             DialogEvent::KeepMine => self.keep_mine(cx),
-            DialogEvent::Save => {
+            DialogEvent::Overwrite => {
                 self.save(true, cx);
                 !self.conflict_open(cx)
             }
             DialogEvent::Restore(key) => self.restore(&key, cx),
             DialogEvent::Discard(key) => {
-                self.safety.discard_key(&key);
+                self.safety.discard_draft(&key);
+                true
+            }
+            DialogEvent::Later | DialogEvent::Cancel => true,
+            DialogEvent::SaveTab(key) => self.save_tab(&key, cx),
+            DialogEvent::DiscardTab(key) => {
+                self.safety.discard_draft(&key);
+                self.with_tabs(cx, move |tabs, cx| tabs.remove_key(&key, cx));
                 true
             }
         };
@@ -420,17 +562,33 @@ impl Workspace {
         }
     }
 
-    /// Loads the file from disk. Returns false if the read fails.
+    /// True while a conflict dialog for `path` is open.
+    fn conflict_for(&self, path: &Path, cx: &App) -> bool {
+        self.dialog.as_ref().is_some_and(
+            |d| matches!(&d.read(cx).kind, DialogKind::Conflict { path: p, .. } if p == path),
+        )
+    }
+
+    /// Key of the active tab's draft.
+    fn active_key(&self, cx: &App) -> Option<String> {
+        self.active_tab(cx).map(|t| t.key)
+    }
+
+    /// Loads the file from disk, dropping the buffer's changes and its draft.
+    /// The stamp is taken from metadata before the read. Returns false if the read fails.
     fn reload(&mut self, cx: &mut Context<Self>) -> bool {
         let (Some(path), Some(editor)) = (self.path.clone(), self.center.clone()) else {
             return true;
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok((mtime, text)) = read_stamped(&path) else {
             eprintln!("broom: could not reload {}", path.display());
             return false;
         };
-        self.safety.record(&path, &text);
+        self.safety.record_stamp(&path, mtime, text.as_bytes());
         self.safety.cancel_save(&path);
+        if let Some(key) = self.active_key(cx) {
+            self.safety.discard_draft(&key);
+        }
         editor.update(cx, |ed, cx| {
             ed.replace_markdown(&text, cx);
             ed.mark_saved();
@@ -438,20 +596,27 @@ impl Workspace {
         true
     }
 
-    /// Keeps the buffer. The disk state is re-stamped, and the buffer is
-    /// autosaved after the usual delay, so it wins.
+    /// Keeps the buffer. The disk state is stamped (metadata before the read),
+    /// so the conflict clears, and the buffer autosaves after the usual delay.
     fn keep_mine(&mut self, _cx: &mut Context<Self>) -> bool {
         let Some(path) = self.path.clone() else {
             return true;
         };
-        if let Ok(disk) = std::fs::read_to_string(&path) {
-            self.safety.record(&path, &disk);
+        match read_stamped(&path) {
+            Ok((mtime, text)) => self.safety.record_stamp(&path, mtime, text.as_bytes()),
+            Err(err) => {
+                // Gone or unreadable on disk: stamp nothing, keep the buffer.
+                eprintln!("broom: keep mine: {err}");
+            }
         }
         self.safety.note_edit(Some(&path));
         true
     }
 
-    /// Restores a recovery draft. A named draft goes back to its file.
+    /// Restores a recovery draft into a tab. A named draft goes into the
+    /// editor of its file (opened if needed). An untitled draft becomes a
+    /// new untitled tab. The draft stays under the tab's key until that tab
+    /// is saved.
     fn restore(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         let Some(entry) = self.recovery_queue.first().cloned() else {
             return true;
@@ -460,21 +625,10 @@ impl Workspace {
             eprintln!("broom: could not read the draft");
             return false;
         };
-        // Tabs call back into this workspace, so the file opens after this update.
-        let tabs = self.tabs.clone();
-        let ws = cx.entity().downgrade();
-        let path = entry.original_path.clone();
-        cx.defer(move |cx| {
-            if let (Some(tabs), Some(path)) = (tabs, path) {
-                tabs.update(cx, |tabs, cx| tabs.open(&path, true, cx));
-            }
-            let _ = ws.update(cx, |this, cx| {
-                if let Some(editor) = this.center.clone() {
-                    editor.update(cx, |ed, cx| ed.replace_markdown(&text, cx));
-                }
-            });
+        let (path, key) = (entry.original_path.clone(), key.to_string());
+        self.with_tabs(cx, move |tabs, cx| {
+            tabs.open_restored(path.as_deref(), &key, &text, cx);
         });
-        self.safety.discard_key(key);
         true
     }
 
