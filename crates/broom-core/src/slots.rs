@@ -145,6 +145,28 @@ pub(crate) struct Line {
     pub(crate) runs: Vec<Run>,
 }
 
+/// Lines with each link shown as `[text](url)`, so a code block keeps the URLs.
+fn link_urls_as_text(lines: &[Line]) -> Vec<Line> {
+    lines
+        .iter()
+        .map(|l| Line {
+            depth: l.depth,
+            checked: l.checked,
+            runs: l
+                .runs
+                .iter()
+                .map(|r| match &r.style.link {
+                    Some(url) => Run {
+                        text: format!("[{}]({})", r.text, url),
+                        style: Style::default(),
+                    },
+                    None => r.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn plain_line(runs: Vec<Run>) -> Line {
     Line {
         depth: 0,
@@ -339,7 +361,7 @@ pub(crate) fn convert(kind: &BlockKind, target: BlockType) -> Result<BlockKind, 
                 lang: None,
                 text: String::new(),
             },
-            &lines,
+            &link_urls_as_text(&lines),
         ),
     };
     result.ok_or_else(|| unsupported("the text cannot be shown as this block kind"))

@@ -23,10 +23,25 @@ pub struct Style {
     pub code: bool,
     /// Inline math `$...$`. `Run::text` is the TeX source, without dollars.
     pub math: bool,
+    /// Inline math written `$$...$$`. Only meaningful with `math`.
+    pub display_math: bool,
     /// Markdown link `[text](url)`. Holds the URL. `Run::text` is the link text.
     pub link: Option<String>,
     /// Wikilink `[[target|alias]]`.
     pub wikilink: Option<WikiTarget>,
+    /// Hard line break. The run text is `\n`. Holds the form the source used,
+    /// so an edited block writes the break the same way.
+    pub hard_break: Option<HardBreak>,
+}
+
+/// How a hard line break was written in markdown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HardBreak {
+    /// Two or more trailing spaces, then the newline (the default).
+    #[default]
+    Spaces,
+    /// A backslash, then the newline.
+    Backslash,
 }
 
 #[cfg(test)]
