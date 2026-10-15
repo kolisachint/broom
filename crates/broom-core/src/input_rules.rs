@@ -119,8 +119,20 @@ pub(crate) fn insert_typed(
     let c = pos.offset + text.chars().count();
     let rule = detect(&probe, c);
     let coalesce = matches!(rule, None | Some(Rule::Started));
+    let plain = std::mem::take(&mut doc.pending_plain) && rule.is_none();
     doc.checkpoint(pos, coalesce, pos.block, pos.block);
     doc.insert_raw(pos, text);
+    if plain {
+        // The chunk just typed takes no style from the rule's content.
+        let lens = slots::slot_lens(&doc.blocks[pos.block].kind);
+        if let Some((k, l)) = slots::locate(&lens, pos.offset) {
+            let n = text.chars().count();
+            doc.with_slot(pos.block, k, |runs| {
+                runs::map_style(runs, l, l + n, |s| *s = Style::default())
+            });
+            doc.sync(pos.block);
+        }
+    }
     let cursor = DocPos::new(pos.block, c);
     Ok(match rule {
         None => InputRuleOutcome::Inserted { cursor },
@@ -401,6 +413,7 @@ fn apply_inline(doc: &mut Document, b: usize, rule: InlineRule) -> InputRuleOutc
         });
     });
     doc.sync(b);
+    doc.pending_plain = true;
     let cursor = slots::slot_start(&slots::slot_lens(&doc.blocks[b].kind), rule.k)
         + rule.open
         + rule.clen;
@@ -556,6 +569,19 @@ mod tests {
             assert_eq!(doc.visible_text(0).unwrap(), text);
             assert_eq!(Document::parse(&doc.to_markdown()).visible_text(0).unwrap(), text);
         }
+    }
+
+    #[test]
+    fn typing_after_an_inline_rule_is_plain() {
+        let mut doc = Document::empty();
+        type_into(&mut doc, 0, "*x*");
+        type_into(&mut doc, 0, "y");
+        assert_eq!(doc.to_markdown(), "*x*y");
+        let BlockKind::Paragraph { content } = doc.block(0).unwrap().kind() else {
+            panic!("paragraph");
+        };
+        assert_eq!(content.last().unwrap().text, "y");
+        assert!(!content.last().unwrap().style.italic);
     }
 
     #[test]

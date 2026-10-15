@@ -27,6 +27,8 @@ pub struct Document {
     // Incremented on every edit. `saved_revision` is the value at the last save.
     pub(crate) revision: u64,
     pub(crate) saved_revision: u64,
+    /// Set when an inline rule fired: the next typed chunk is plain text.
+    pub(crate) pending_plain: bool,
 }
 
 impl Clone for Document {
@@ -49,6 +51,7 @@ impl Document {
             undo: UndoStack::default(),
             revision: 0,
             saved_revision: 0,
+            pending_plain: false,
         }
     }
 
@@ -60,6 +63,7 @@ impl Document {
             undo: UndoStack::default(),
             revision: 0,
             saved_revision: 0,
+            pending_plain: false,
         }
     }
 
@@ -196,6 +200,7 @@ impl Document {
             return Ok(r.start);
         }
         if r.start.block == r.end.block {
+            self.check_same_block_delete(r)?;
             self.checkpoint(r.start, false, r.start.block, r.start.block);
             self.delete_in_block(r.start.block, r.start.offset, r.end.offset);
         } else {
@@ -218,6 +223,23 @@ impl Document {
             parts.push(chars[from..to].iter().collect::<String>());
         }
         Ok(parts.join("\n"))
+    }
+
+    /// Deleting across cells or quote children is refused: the structure cannot
+    /// be joined, and clearing part of it would silently lose the rest.
+    fn check_same_block_delete(&self, r: DocRange) -> Result<(), EditError> {
+        let b = r.start.block;
+        if matches!(self.blocks[b].kind, BlockKind::Table { .. } | BlockKind::BlockQuote { .. }) {
+            let lens = self.lens(b);
+            let first = slots::locate(&lens, r.start.offset).map(|p| p.0);
+            let last = slots::locate(&lens, r.end.offset).map(|p| p.0);
+            if first != last {
+                return Err(EditError::Unsupported(
+                    "a range across table cells or quote lines cannot be deleted".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Checks a range for editing: ordered, in bounds, no opaque blocks.
@@ -363,6 +385,7 @@ impl Document {
             undo: UndoStack::default(),
             revision: self.revision,
             saved_revision: self.saved_revision,
+            pending_plain: false,
         }
     }
 
@@ -575,6 +598,15 @@ mod edit_tests {
         doc.set_block_kind(0, BlockType::Paragraph).unwrap();
         assert_eq!(doc.to_markdown(), "h\n\npara\n");
         assert_eq!(doc.block_count(), 2);
+    }
+
+    #[test]
+    fn delete_across_table_cells_is_refused() {
+        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let mut doc = Document::parse(src);
+        let r = DocRange::new(at(0, 0), at(0, 3));
+        assert!(matches!(doc.delete_range(r), Err(EditError::Unsupported(_))));
+        assert_eq!(doc.to_markdown(), src);
     }
 
     #[test]
