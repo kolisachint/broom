@@ -1,91 +1,23 @@
 //! The `broom` binary.
 //!
-//! Scaffold: opens one window titled "broom" with three placeholder panes
-//! (tree | editor | right panel) and a status bar. No crate logic is wired
-//! yet, so nothing here calls a `todo!()` stub at runtime.
+//! Opens one window: left panel slot | editor | right panel slot, and a
+//! status bar. See [`workspace`] for the panel hooks.
 //!
 //! Usage: `broom [folder]`. Defaults to the current folder (or `$HOME` when
 //! the current folder is `/`, as it is when launched from Finder).
 
+// scaffold: remove once the panels and key routing use the editor API.
+#![allow(dead_code)]
+
+mod editor;
+mod theme;
+mod workspace;
+
 use std::path::PathBuf;
 
-use broom_config::Settings;
-use broom_vim::Mode;
 use gpui_kit::*;
 
-// Solarized Light base tones.
-const BASE3: u32 = 0xfdf6e3; // background
-const BASE2: u32 = 0xeee8d5; // pane / status bar
-const BASE01: u32 = 0x586e75; // muted text
-const BASE00: u32 = 0x657b83; // body text
-
-/// Root view: three panes and a status bar.
-struct BroomWindow {
-    folder: PathBuf,
-}
-
-impl BroomWindow {
-    fn pane(title: &str, width: Pixels) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .w(width)
-            .h_full()
-            .p_2()
-            .gap_2()
-            .bg(rgb(BASE2))
-            .text_color(rgb(BASE01))
-            .child(title.to_string())
-    }
-}
-
-impl Render for BroomWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let font_size = Settings::default().font_size;
-        let mode = Mode::Normal.label();
-        let folder = self.folder.display().to_string();
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(rgb(BASE3))
-            .text_color(rgb(BASE00))
-            .text_size(px(font_size))
-            .child(
-                // Main row: tree | editor | right panel.
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .child(BroomWindow::pane("Files", px(240.)).child(folder))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .p_6()
-                            .child("Editor (placeholder)"),
-                    )
-                    .child(BroomWindow::pane("Outline / Backlinks", px(260.))),
-            )
-            .child(
-                // Status bar: mode word | file | word count | save state. Text only.
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .px_3()
-                    .py_1()
-                    .bg(rgb(BASE2))
-                    .text_color(rgb(BASE01))
-                    .child(mode)
-                    .child("Untitled")
-                    .child("0 words")
-                    .child("Saved"),
-            )
-    }
-}
+use workspace::Workspace;
 
 /// Folder from the first CLI argument, else the current directory (or `$HOME`).
 fn workspace_root() -> PathBuf {
@@ -121,8 +53,10 @@ fn main() {
                 ..Default::default()
             };
 
-            gpui_kit::open_window(options, cx, move |_, cx| cx.new(|_| BroomWindow { folder }))
-                .expect("failed to open the broom window");
+            gpui_kit::open_window(options, cx, move |_, cx| {
+                cx.new(|cx| Workspace::new(folder, cx))
+            })
+            .expect("failed to open the broom window");
 
             cx.activate(true);
         });

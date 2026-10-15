@@ -64,7 +64,10 @@ pub enum Marker {
     Bullet,
     Number(usize),
     /// `index` is the task's position among the block's tasks.
-    Task { checked: bool, index: usize },
+    Task {
+        checked: bool,
+        index: usize,
+    },
 }
 
 /// One visual row of a block.
@@ -288,7 +291,11 @@ fn item_lines(
             None => Marker::Bullet,
         };
         let groups = split_runs(&item.content);
-        let groups = if groups.is_empty() { vec![Vec::new()] } else { groups };
+        let groups = if groups.is_empty() {
+            vec![Vec::new()]
+        } else {
+            groups
+        };
         let gn = groups.len();
         for (g, pieces) in groups.into_iter().enumerate() {
             let seg = seg_from_pieces(off, &pieces);
@@ -349,10 +356,10 @@ fn split_runs(runs: &[Run]) -> Vec<Vec<Piece>> {
             if i > 0 {
                 lines.push(Vec::new());
             }
-            if !part.is_empty() {
-                if let Some(last) = lines.last_mut() {
-                    last.push((part.to_string(), style.clone()));
-                }
+            if !part.is_empty()
+                && let Some(last) = lines.last_mut()
+            {
+                last.push((part.to_string(), style.clone()));
             }
         }
     }
@@ -399,7 +406,8 @@ pub fn byte_index(text: &str, chars: usize) -> usize {
 
 /// Char index in `text` of byte index `bytes`.
 pub fn char_index(text: &str, bytes: usize) -> usize {
-    text.get(..bytes.min(text.len())).map_or(0, |s| s.chars().count())
+    text.get(..bytes.min(text.len()))
+        .map_or(0, |s| s.chars().count())
 }
 
 #[cfg(test)]

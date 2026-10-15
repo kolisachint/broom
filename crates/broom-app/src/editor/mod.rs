@@ -12,7 +12,7 @@ pub mod vim;
 use std::ops::Range;
 
 use broom_config::{Command, VimBindings};
-use broom_core::{BlockKind, BlockType, DocPos, DocRange, Document, InputRuleOutcome, StyleFlag};
+use broom_core::{BlockKind, DocPos, DocRange, Document, InputRuleOutcome, StyleFlag};
 use broom_vim::{Cursor, Key, KeyInput, Selection, Vim, VimOutcome};
 use gpui_kit::component::input::{EditorState, InputEvent};
 use gpui_kit::*;
@@ -245,7 +245,9 @@ impl Editor {
     /// Index into `segs` of the segment holding `pos`.
     fn seg_index(&self, pos: DocPos) -> Option<usize> {
         self.segs.iter().position(|s| {
-            s.block == pos.block && pos.offset >= s.start && pos.offset <= s.start + s.text.chars().count()
+            s.block == pos.block
+                && pos.offset >= s.start
+                && pos.offset <= s.start + s.text.chars().count()
         })
     }
 
@@ -285,7 +287,10 @@ impl Editor {
         let ty = p.y + lh * dir as f32;
         let b = seg.layout.bounds();
         if ty >= b.top() && ty < b.bottom() {
-            let i = seg.layout.index_for_position(point(x, ty)).unwrap_or_else(|e| e);
+            let i = seg
+                .layout
+                .index_for_position(point(x, ty))
+                .unwrap_or_else(|e| e);
             return Some(DocPos::new(seg.block, seg.start + char_index(&seg.text, i)));
         }
         let j = idx as isize + dir as isize;
@@ -299,8 +304,14 @@ impl Editor {
         } else {
             nb.bottom() - lh / 2.0
         };
-        let i = next.layout.index_for_position(point(x, ny)).unwrap_or_else(|e| e);
-        Some(DocPos::new(next.block, next.start + char_index(&next.text, i)))
+        let i = next
+            .layout
+            .index_for_position(point(x, ny))
+            .unwrap_or_else(|e| e);
+        Some(DocPos::new(
+            next.block,
+            next.start + char_index(&next.text, i),
+        ))
     }
 
     /// Up/down through the document's line view, used before layout exists.
@@ -355,12 +366,17 @@ impl Editor {
     }
 
     /// Caret placed by a pointer press or drag.
-    pub fn pointer_down(&mut self, pos: DocPos, extend: bool, cmd: bool, link: Option<LinkTarget>, cx: &mut Context<Self>) {
-        if cmd {
-            if let Some(target) = link {
-                cx.emit(EditorEvent::Link(target));
-                return;
-            }
+    pub fn pointer_down(
+        &mut self,
+        pos: DocPos,
+        extend: bool,
+        cmd: bool,
+        link: Option<LinkTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        if cmd && let Some(target) = link {
+            cx.emit(EditorEvent::Link(target));
+            return;
         }
         self.pref_x = None;
         self.set_cursor(pos, extend);
@@ -442,11 +458,11 @@ impl Editor {
                 self.cursor = pos;
                 self.after_edit(cx);
             }
-        } else if self.cursor.block > 0 {
-            if let Ok(pos) = self.doc.merge_blocks(self.cursor.block - 1) {
-                self.cursor = pos;
-                self.after_edit(cx);
-            }
+        } else if self.cursor.block > 0
+            && let Ok(pos) = self.doc.merge_blocks(self.cursor.block - 1)
+        {
+            self.cursor = pos;
+            self.after_edit(cx);
         }
         self.refresh_wiki();
     }
@@ -464,11 +480,11 @@ impl Editor {
                 self.cursor = pos;
                 self.after_edit(cx);
             }
-        } else if self.cursor.block + 1 < self.doc.block_count() {
-            if let Ok(pos) = self.doc.merge_blocks(self.cursor.block) {
-                self.cursor = pos;
-                self.after_edit(cx);
-            }
+        } else if self.cursor.block + 1 < self.doc.block_count()
+            && let Ok(pos) = self.doc.merge_blocks(self.cursor.block)
+        {
+            self.cursor = pos;
+            self.after_edit(cx);
         }
     }
 
@@ -509,7 +525,11 @@ impl Editor {
     }
 
     fn undo_redo(&mut self, redo: bool, cx: &mut Context<Self>) {
-        let pos = if redo { self.doc.redo() } else { self.doc.undo() };
+        let pos = if redo {
+            self.doc.redo()
+        } else {
+            self.doc.undo()
+        };
         if let Some(pos) = pos {
             self.cursor = pos;
             self.anchor = None;
@@ -530,7 +550,10 @@ impl Editor {
                 if i == block {
                     src.clone()
                 } else {
-                    self.doc.block(i).map(|x| x.source().to_string()).unwrap_or_default()
+                    self.doc
+                        .block(i)
+                        .map(|x| x.source().to_string())
+                        .unwrap_or_default()
                 }
             })
             .collect();
@@ -562,7 +585,12 @@ impl Editor {
 
     pub fn jump_heading(&mut self, forward: bool) {
         let headings: Vec<usize> = (0..self.doc.block_count())
-            .filter(|&b| matches!(self.doc.block(b).map(|x| x.kind()), Some(BlockKind::Heading { .. })))
+            .filter(|&b| {
+                matches!(
+                    self.doc.block(b).map(|x| x.kind()),
+                    Some(BlockKind::Heading { .. })
+                )
+            })
             .collect();
         let cur = self.cursor.block;
         let target = if forward {
@@ -626,15 +654,15 @@ impl Editor {
             .pos_to_line(self.cursor)
             .map(|(line, col)| Cursor { line, col })
             .unwrap_or_default();
-        let visual = matches!(self.vim.mode(), broom_vim::Mode::Visual | broom_vim::Mode::VisualLine);
+        let visual = matches!(
+            self.vim.mode(),
+            broom_vim::Mode::Visual | broom_vim::Mode::VisualLine
+        );
         let selection = match (visual, self.anchor) {
-            (true, Some(a)) => self
-                .doc
-                .pos_to_line(a)
-                .map(|(line, col)| Selection {
-                    anchor: Cursor { line, col },
-                    head: start,
-                }),
+            (true, Some(a)) => self.doc.pos_to_line(a).map(|(line, col)| Selection {
+                anchor: Cursor { line, col },
+                head: start,
+            }),
             _ => None,
         };
         let (out, cursor, sel) = {
@@ -685,11 +713,15 @@ impl Editor {
         let md = self.markdown();
         let state = cx.new(|cx| EditorState::new(window, cx));
         state.update(cx, |s, cx| s.set_value(md, window, cx));
-        let sub = cx.subscribe_in(&state, window, |this: &mut Editor, _state, ev: &InputEvent, _window, cx| {
-            if matches!(ev, InputEvent::Change) {
-                this.sync_from_source(cx);
-            }
-        });
+        let sub = cx.subscribe_in(
+            &state,
+            window,
+            |this: &mut Editor, _state, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.sync_from_source(cx);
+                }
+            },
+        );
         self.source = Some(state);
         self.subs.push(sub);
     }
@@ -798,11 +830,18 @@ impl Editor {
                 if query.contains([']', '|', '\n']) {
                     None
                 } else {
-                    let same = self.wiki.as_ref().is_some_and(|w| w.query == query && w.block == block);
+                    let same = self
+                        .wiki
+                        .as_ref()
+                        .is_some_and(|w| w.query == query && w.block == block);
                     if !same {
                         self.wiki_sel = 0;
                     }
-                    Some(WikiQuery { block, start, query })
+                    Some(WikiQuery {
+                        block,
+                        start,
+                        query,
+                    })
                 }
             }
             None => None,
@@ -815,7 +854,11 @@ impl Editor {
             return;
         };
         let from = DocPos::new(wiki.block, wiki.start);
-        if self.doc.delete_range(DocRange::new(from, self.cursor)).is_ok() {
+        if self
+            .doc
+            .delete_range(DocRange::new(from, self.cursor))
+            .is_ok()
+        {
             self.cursor = from;
             if let Ok(pos) = self.doc.insert_text(from, &format!("[[{target}]]")) {
                 self.cursor = pos;
@@ -838,7 +881,6 @@ impl Editor {
         self.wiki_sel = (self.wiki_sel as i32 + delta).rem_euclid(n) as usize;
         cx.notify();
     }
-
 }
 
 /// Rewrites the `index`-th task checkbox in `source`. Returns the new source,
@@ -854,7 +896,10 @@ pub fn toggle_task_source(source: &str, index: usize) -> Option<String> {
             .split_once(". ")
             .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
         let is_task = is_bullet || is_numbered;
-        let marker_at = line.find("[ ]").or_else(|| line.find("[x]")).or_else(|| line.find("[X]"));
+        let marker_at = line
+            .find("[ ]")
+            .or_else(|| line.find("[x]"))
+            .or_else(|| line.find("[X]"));
         match marker_at {
             Some(pos) if is_task && !done => {
                 if seen == index {

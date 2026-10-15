@@ -15,7 +15,11 @@ pub struct DocBuffer<'a> {
 }
 
 impl<'a> DocBuffer<'a> {
-    pub fn new(doc: &'a mut Document, cursor: Cursor, selection: Option<Selection>) -> DocBuffer<'a> {
+    pub fn new(
+        doc: &'a mut Document,
+        cursor: Cursor,
+        selection: Option<Selection>,
+    ) -> DocBuffer<'a> {
         DocBuffer {
             doc,
             cursor,
@@ -28,7 +32,9 @@ impl<'a> DocBuffer<'a> {
     }
 
     fn to_cursor(&self, p: DocPos) -> Option<Cursor> {
-        self.doc.pos_to_line(p).map(|(line, col)| Cursor { line, col })
+        self.doc
+            .pos_to_line(p)
+            .map(|(line, col)| Cursor { line, col })
     }
 
     fn range(&self, r: TextRange) -> Option<DocRange> {
@@ -69,12 +75,11 @@ impl VimBuffer for DocBuffer<'_> {
 
     fn delete_range(&mut self, range: TextRange) -> String {
         let text = self.text_in_range(range);
-        if let Some(r) = self.range(range) {
-            if let Ok(p) = self.doc.delete_range(r) {
-                if let Some(c) = self.to_cursor(p) {
-                    self.cursor = c;
-                }
-            }
+        if let Some(r) = self.range(range)
+            && let Ok(p) = self.doc.delete_range(r)
+            && let Some(c) = self.to_cursor(p)
+        {
+            self.cursor = c;
         }
         text
     }
@@ -91,7 +96,12 @@ impl VimBuffer for DocBuffer<'_> {
 
     fn find_heading(&self, from_line: usize, forward: bool) -> Option<usize> {
         let lines: Vec<usize> = (0..self.doc.block_count())
-            .filter(|&b| matches!(self.doc.block(b).map(|x| x.kind()), Some(BlockKind::Heading { .. })))
+            .filter(|&b| {
+                matches!(
+                    self.doc.block(b).map(|x| x.kind()),
+                    Some(BlockKind::Heading { .. })
+                )
+            })
             .filter_map(|b| self.doc.pos_to_line(DocPos::new(b, 0)).map(|(l, _)| l))
             .collect();
         if forward {

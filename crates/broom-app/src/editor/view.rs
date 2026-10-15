@@ -7,7 +7,7 @@ use gpui_kit::*;
 
 use broom_core::{Align, DocPos, DocRange};
 
-use super::rows::{block_lines, byte_index, char_index, Deco, Line, Marker, Seg};
+use super::rows::{Deco, Line, Marker, Seg, block_lines, byte_index, char_index};
 use super::{Editor, LinkTarget, SegHandle, ViewMode};
 use crate::theme::{self, color};
 
@@ -128,7 +128,10 @@ impl Editor {
     fn line_has_caret(&self, line: &Line) -> bool {
         let c = self.cursor;
         c.block == line.block
-            && line.segs.iter().any(|s| c.offset >= s.start && c.offset <= s.start + s.chars())
+            && line
+                .segs
+                .iter()
+                .any(|s| c.offset >= s.start && c.offset <= s.start + s.chars())
     }
 
     fn render_line(&mut self, line: &Line, cx: &mut Context<Self>) -> AnyElement {
@@ -142,7 +145,9 @@ impl Editor {
                 color(theme::INK),
                 true,
             ),
-            Deco::Code | Deco::Math | Deco::Front => (mono.clone(), size * 0.92, color(theme::INK), false),
+            Deco::Code | Deco::Math | Deco::Front => {
+                (mono.clone(), size * 0.92, color(theme::INK), false)
+            }
             Deco::Opaque => (mono.clone(), size * 0.92, color(theme::MUTED), false),
             Deco::Rule | Deco::Plain => (body.clone(), size, color(theme::INK), false),
         };
@@ -179,7 +184,10 @@ impl Editor {
         };
 
         let mut inner = div().flex_1().min_w_0().child(content);
-        if matches!(line.deco, Deco::Code | Deco::Math | Deco::Front | Deco::Opaque) {
+        if matches!(
+            line.deco,
+            Deco::Code | Deco::Math | Deco::Front | Deco::Opaque
+        ) {
             inner = inner.bg(color(theme::PANEL)).px_3();
         }
         if matches!(line.deco, Deco::Heading(_)) && line.first {
@@ -471,32 +479,26 @@ fn paint_overlay(
 ) {
     let lh = layout.line_height();
     let b = layout.bounds();
-    if let Some((a, z)) = sel {
-        if let (Some(p0), Some(p1)) = (layout.position_for_index(a), layout.position_for_index(z)) {
-            let sel_color = color(theme::SELECTION);
-            if (p1.y - p0.y).abs() < lh * 0.5 {
+    if let Some((a, z)) = sel
+        && let (Some(p0), Some(p1)) = (layout.position_for_index(a), layout.position_for_index(z))
+    {
+        let sel_color = color(theme::SELECTION);
+        if (p1.y - p0.y).abs() < lh * 0.5 {
+            window.paint_quad(fill(Bounds::new(p0, size(p1.x - p0.x, lh)), sel_color));
+        } else {
+            window.paint_quad(fill(Bounds::new(p0, size(b.right() - p0.x, lh)), sel_color));
+            let mut y = p0.y + lh;
+            while y < p1.y - lh * 0.5 {
                 window.paint_quad(fill(
-                    Bounds::new(p0, size(p1.x - p0.x, lh)),
+                    Bounds::new(point(b.left(), y), size(b.size.width, lh)),
                     sel_color,
                 ));
-            } else {
-                window.paint_quad(fill(
-                    Bounds::new(p0, size(b.right() - p0.x, lh)),
-                    sel_color,
-                ));
-                let mut y = p0.y + lh;
-                while y < p1.y - lh * 0.5 {
-                    window.paint_quad(fill(
-                        Bounds::new(point(b.left(), y), size(b.size.width, lh)),
-                        sel_color,
-                    ));
-                    y += lh;
-                }
-                window.paint_quad(fill(
-                    Bounds::new(point(b.left(), p1.y), size(p1.x - b.left(), lh)),
-                    sel_color,
-                ));
+                y += lh;
             }
+            window.paint_quad(fill(
+                Bounds::new(point(b.left(), p1.y), size(p1.x - b.left(), lh)),
+                sel_color,
+            ));
         }
     }
     if let Some(c) = caret {
