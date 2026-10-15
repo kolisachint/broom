@@ -1,0 +1,11 @@
+[package]
+name = "broom-links"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+broom-fs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

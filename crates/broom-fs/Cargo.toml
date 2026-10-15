@@ -1,0 +1,11 @@
+[package]
+name = "broom-fs"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+notify.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

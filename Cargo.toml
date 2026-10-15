@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/broom-core",
+    "crates/broom-vim",
+    "crates/broom-links",
+    "crates/broom-fs",
+    "crates/broom-config",
+    "crates/broom-math",
+    "crates/broom-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+broom-core = { path = "crates/broom-core" }
+broom-vim = { path = "crates/broom-vim" }
+broom-links = { path = "crates/broom-links" }
+broom-fs = { path = "crates/broom-fs" }
+broom-config = { path = "crates/broom-config" }
+broom-math = { path = "crates/broom-math" }
+
+# UI. gpui-kit 0.7.3 is the umbrella crate: it pins gpui-component 0.7.3,
+# which pins GPUI as the `gpui-pre` family at =0.3.9. Exact pin on purpose.
+gpui-kit = "=0.7.3"
+
+# Third-party
+notify = "8.2"
+pulldown-cmark = "0.13"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.9"
+tempfile = "3"

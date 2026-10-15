@@ -1,0 +1,18 @@
+[package]
+name = "broom-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "broom"
+path = "src/main.rs"
+
+[dependencies]
+broom-config.workspace = true
+broom-core.workspace = true
+broom-fs.workspace = true
+broom-links.workspace = true
+broom-math.workspace = true
+broom-vim.workspace = true
+gpui-kit.workspace = true
