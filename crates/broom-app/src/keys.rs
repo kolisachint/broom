@@ -209,3 +209,70 @@ impl Workspace {
         cx.notify();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{chord_text, context_of, Run};
+    use broom_config::{Chord, Keymap};
+    use gpui_kit::{KeyBinding, Keystroke, Modifiers};
+
+    /// The keystroke macOS reports for a chord: `key` is the unmodified key
+    /// (lowercase letter, or the punctuation on the key), Shift and Cmd as flags.
+    fn mac_keystroke(c: &Chord) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                control: c.ctrl,
+                alt: c.alt,
+                shift: c.shift,
+                platform: c.cmd,
+                function: false,
+            },
+            key: c.key.clone(),
+            key_char: None,
+        }
+    }
+
+    #[test]
+    fn every_default_binding_parses_in_gpui() {
+        for b in &Keymap::defaults().bindings {
+            let text = b
+                .chords
+                .iter()
+                .map(chord_text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let binding = KeyBinding::new(&text, Run(b.command), context_of(b.context));
+            let steps: Vec<&str> = text.split(' ').collect();
+            assert_eq!(binding.keystrokes().len(), steps.len(), "{text}");
+        }
+    }
+
+    #[test]
+    fn every_default_chord_matches_its_macos_keystroke() {
+        for b in &Keymap::defaults().bindings {
+            for c in &b.chords {
+                let text = chord_text(c);
+                let binding = KeyBinding::new(&text, Run(b.command), None);
+                let typed = mac_keystroke(c);
+                assert_eq!(
+                    binding.match_keystrokes(std::slice::from_ref(&typed)),
+                    Some(false),
+                    "{text} does not match the macOS keystroke {typed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_and_shift_chords_convert_as_macos_reports_them() {
+        let cmd_slash = Chord::parse("cmd+/").unwrap();
+        let cmd_eq = Chord::parse("cmd+=").unwrap();
+        let cmd_shift_p = Chord::parse("cmd+shift+p").unwrap();
+        assert_eq!(chord_text(&cmd_slash), "cmd-/");
+        assert_eq!(chord_text(&cmd_eq), "cmd-=");
+        assert_eq!(chord_text(&cmd_shift_p), "shift-cmd-p");
+        let typed = mac_keystroke(&cmd_shift_p);
+        assert_eq!(typed.key, "p");
+        assert!(typed.modifiers.shift && typed.modifiers.platform);
+    }
+}
