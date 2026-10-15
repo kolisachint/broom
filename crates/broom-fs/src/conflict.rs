@@ -17,6 +17,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// What happened on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,17 +55,37 @@ impl ConflictDetector {
     }
 
     /// Records the state broom now holds for `path`: `contents` is what was
-    /// just read from or written to disk. Reads the mtime from disk.
+    /// just read from or written to disk. See [`ConflictDetector::record_bytes`].
     pub fn record(&mut self, path: &Path, contents: &str) -> io::Result<()> {
+        self.record_bytes(path, contents.as_bytes())
+    }
+
+    /// Like [`ConflictDetector::record`] for raw bytes. The hash covers the
+    /// exact bytes: pass what was read or written, with no newline changes and
+    /// no lossy UTF-8 conversion.
+    ///
+    /// The mtime is read from disk now. If another process may have written
+    /// `path` since `bytes` were read, that write would be taken as ours. Use
+    /// [`ConflictDetector::record_stamp`] with an mtime from before the read,
+    /// or from [`crate::write_atomic_stamped`], instead.
+    pub fn record_bytes(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mtime = fs::metadata(path)?.modified().ok();
+        self.record_stamp(path, mtime, bytes);
+        Ok(())
+    }
+
+    /// Records `bytes` for `path` with an mtime the caller already took: from
+    /// [`crate::write_atomic_stamped`] after a save, or from `fs::metadata`
+    /// called before reading `bytes`. No disk access happens here, so a write
+    /// that lands after the stamp is still reported by [`ConflictDetector::check`].
+    pub fn record_stamp(&mut self, path: &Path, mtime: Option<SystemTime>, bytes: &[u8]) {
         self.stamps.insert(
             path.to_path_buf(),
             Stamp {
                 mtime,
-                hash: Self::hash_contents(contents),
+                hash: crate::fnv1a(bytes),
             },
         );
-        Ok(())
     }
 
     /// Compares disk against the recorded stamp. Returns `Ok(None)` when there
@@ -95,7 +116,7 @@ impl ConflictDetector {
             }
             Err(err) => return Err(err),
         };
-        if fnv_hash(&bytes) == stamped_hash {
+        if crate::fnv1a(&bytes) == stamped_hash {
             // Only the mtime moved. Remember the new mtime so it is not re-read.
             if let Some(stamp) = self.stamps.get_mut(path) {
                 stamp.mtime = mtime;
@@ -115,7 +136,7 @@ impl ConflictDetector {
 
     /// Stable content hash used for stamps. Not cryptographic.
     pub fn hash_contents(contents: &str) -> u64 {
-        fnv_hash(contents.as_bytes())
+        crate::fnv1a(contents.as_bytes())
     }
 }
 
@@ -124,10 +145,6 @@ fn deleted(path: &Path) -> Conflict {
         path: path.to_path_buf(),
         kind: ConflictKind::Deleted,
     }
-}
-
-fn fnv_hash(bytes: &[u8]) -> u64 {
-    crate::fnv1a(bytes)
 }
 
 #[cfg(test)]
@@ -296,6 +313,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut detector = ConflictDetector::new();
         assert!(detector.record(&dir.path().join("nope.md"), "x").is_err());
+    }
+
+    #[test]
+    fn external_write_after_own_save_is_still_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "old");
+        set_mtime(&file, base_time());
+        let mut detector = ConflictDetector::new();
+        detector.record(&file, "old").unwrap();
+
+        // broom saves "mine"; another process then writes "theirs" before
+        // broom records anything. The stamp must come from the save, not disk.
+        let mine = crate::write_atomic_stamped(&file, b"mine").unwrap();
+        write(&file, "theirs");
+        set_mtime(&file, base_time() + Duration::from_secs(60));
+        detector.record_stamp(&file, mine, b"mine");
+
+        assert_eq!(
+            detector.check(&file).unwrap(),
+            Some(Conflict {
+                path: file.clone(),
+                kind: ConflictKind::Modified,
+            })
+        );
+    }
+
+    #[test]
+    fn record_bytes_hashes_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        write(&file, "a\r\nb");
+        let mut detector = ConflictDetector::new();
+        // Recording LF-normalised text would miss the CRLF on disk.
+        detector.record_bytes(&file, b"a\r\nb").unwrap();
+        assert_eq!(detector.check(&file).unwrap(), None);
+
+        write(&file, "a\nb");
+        set_mtime(&file, base_time() + Duration::from_secs(9));
+        assert!(detector.check(&file).unwrap().is_some());
+    }
+
+    #[test]
+    fn record_bytes_accepts_non_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bin.md");
+        let bytes: &[u8] = &[0xff, 0xfe, 0x00, b'x'];
+        fs::write(&file, bytes).unwrap();
+        let mut detector = ConflictDetector::new();
+        detector.record_bytes(&file, bytes).unwrap();
+        assert_eq!(detector.check(&file).unwrap(), None);
     }
 
     #[test]

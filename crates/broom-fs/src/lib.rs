@@ -24,6 +24,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 /// Default threshold for "large file" handling: 1 MiB.
 /// Settings override this via `large_file_bytes` in broom-config.
@@ -101,6 +102,16 @@ fn collect_markdown(dir: &Path, found: &mut Vec<PathBuf>) -> io::Result<()> {
 /// A symlink at `path` is followed, so the link is kept and its target is
 /// replaced. The existing file's permissions are kept.
 pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    write_atomic_stamped(path, contents.as_bytes()).map(|_| ())
+}
+
+/// Like [`write_atomic`] for raw bytes. Returns the mtime of the file as it
+/// was written, taken from the open handle before the rename. Pass it to
+/// [`ConflictDetector::record_stamp`]: a later external write then shows up
+/// as a conflict instead of being taken as ours.
+///
+/// `None` if the platform gave no mtime.
+pub fn write_atomic_stamped(path: &Path, bytes: &[u8]) -> io::Result<Option<SystemTime>> {
     let target = match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
         _ => path.to_path_buf(),
@@ -122,26 +133,32 @@ pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
 
-    let result: io::Result<()> = (|| {
+    let result: io::Result<Option<SystemTime>> = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         if let Ok(meta) = fs::metadata(&target) {
             file.set_permissions(meta.permissions())?;
         }
-        file.write_all(contents.as_bytes())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
+        // The inode keeps this mtime through the rename.
+        let mtime = file.metadata()?.modified().ok();
         drop(file);
-        fs::rename(&tmp, &target)
+        fs::rename(&tmp, &target)?;
+        Ok(mtime)
     })();
 
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
+    let mtime = match result {
+        Ok(mtime) => mtime,
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+    };
     // Best effort: make the rename itself durable.
     if let Ok(dir_handle) = File::open(dir) {
         let _ = dir_handle.sync_all();
     }
-    Ok(())
+    Ok(mtime)
 }
 
 /// FNV-1a, 64-bit. Fixed algorithm, so values stay the same across Rust
