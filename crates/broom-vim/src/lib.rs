@@ -20,6 +20,7 @@ pub mod buffer;
 pub mod key;
 pub mod machine;
 pub mod motion;
+pub mod register;
 pub mod textobj;
 #[cfg(test)]
 mod mock;
