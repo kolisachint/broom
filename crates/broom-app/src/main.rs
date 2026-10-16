@@ -58,11 +58,14 @@ fn main() {
 
             // Fits a 1280x800 logical screen with the title bar and menu bar.
             let bounds = Bounds::centered(None, size(px(1120.), px(720.)), cx);
+            // Transparent titlebar: the window draws its own cream title row.
+            // The traffic lights sit inside that row, clear of its content.
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("broom".into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.), px(10.))),
                 }),
                 ..Default::default()
             };
@@ -73,6 +76,9 @@ fn main() {
                 ws
             })
             .expect("failed to open the broom window");
+
+            // The folder's start note, if it has one. Otherwise the empty state shows.
+            ws.update(cx, |ws, cx| ws.open_startup(cx));
 
             // Quit keeps every edit: dirty named tabs are saved, all dirty tabs drafted.
             let quit_ws = ws.clone();

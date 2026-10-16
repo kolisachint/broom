@@ -101,9 +101,12 @@ impl Tabs {
             pinned,
             _sub: sub,
         };
-        // A preview replaces the existing preview tab in place.
-        let idx = match (pinned, self.tabs.iter().position(|t| !t.pinned)) {
-            (false, Some(idx)) => {
+        // An empty untitled tab that was never typed in gives way to the file.
+        // Otherwise a preview replaces the existing preview tab in place.
+        let untouched = self.untouched_untitled(cx);
+        let preview = self.tabs.iter().position(|t| !t.pinned);
+        let idx = match (untouched, pinned, preview) {
+            (Some(idx), _, _) | (None, false, Some(idx)) => {
                 self.tabs[idx] = tab;
                 idx
             }
@@ -219,6 +222,14 @@ impl Tabs {
     fn fresh_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// Index of an untitled tab with no text and no edits.
+    fn untouched_untitled(&self, cx: &App) -> Option<usize> {
+        self.tabs.iter().position(|t| {
+            let ed = t.editor.read(cx);
+            t.path.is_none() && !ed.is_dirty() && ed.markdown().trim().is_empty()
+        })
     }
 
     fn index_of_path(&self, path: &Path) -> Option<usize> {
