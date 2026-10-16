@@ -256,7 +256,16 @@ impl Editor {
             bold,
         };
 
-        let content: AnyElement = if line.table {
+        // The empty last line of an opaque block (a source that ends in a
+        // newline) would add a blank row under the box. Give it no height.
+        let trailing_empty = line.deco == Deco::Opaque
+            && last
+            && !line.first
+            && line.segs.first().is_some_and(|s| s.text.is_empty());
+
+        let content: AnyElement = if trailing_empty {
+            div().h(px(0.)).into_any_element()
+        } else if line.table {
             self.render_table_row(line, &base, window, cx)
                 .into_any_element()
         } else if let Some(note) = &line.note {
@@ -556,6 +565,32 @@ impl Editor {
             window.text_system().ascent(fid, base.size),
             window.text_system().descent(fid, base.size),
         );
+        // A formula taller than the text line grows the line box, so it does
+        // not paint over the lines above or below.
+        let lh = base.size * theme::LINE_HEIGHT;
+        let (ascent, descent) = metrics;
+        let inset = (lh - (ascent + descent)) / 2.0;
+        let (mut above, mut below) = (px(0.), px(0.));
+        for d in &draws {
+            let up = d.math.baseline * d.scale;
+            let down = (d.math.size.height - d.math.baseline) * d.scale;
+            if up > above {
+                above = up;
+            }
+            if down > below {
+                below = down;
+            }
+        }
+        let pad_top = if above > inset + ascent {
+            above - (inset + ascent)
+        } else {
+            px(0.)
+        };
+        let pad_bottom = if below > lh - inset - ascent {
+            below - (lh - inset - ascent)
+        } else {
+            px(0.)
+        };
         let overlay = canvas(
             |_, _, _| (),
             move |_bounds, _, window, _cx| {
@@ -572,7 +607,9 @@ impl Editor {
         div()
             .relative()
             .w_full()
-            .min_h(base.size * theme::LINE_HEIGHT)
+            .min_h(lh)
+            .pt(pad_top)
+            .pb(pad_bottom)
             .text_size(base.size)
             .line_height(relative(theme::LINE_HEIGHT))
             .child(styled)
@@ -607,6 +644,9 @@ fn space_above(line: &Line, body: Pixels) -> Pixels {
     };
     if let Deco::Heading(level) = line.deco {
         top += body * theme::heading_scale(level) * 0.6;
+    }
+    if line.table {
+        top += body * theme::BLOCK_GAP;
     }
     top
 }
