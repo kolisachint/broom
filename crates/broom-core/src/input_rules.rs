@@ -117,7 +117,7 @@ pub(crate) fn insert_typed(
     let mut probe = doc.blocks[pos.block].kind.clone();
     crate::ops::insert_into_kind(&mut probe, pos.offset, text).ok_or(EditError::OutOfRange(pos))?;
     let c = pos.offset + text.chars().count();
-    let rule = detect(&probe, c);
+    let rule = detect(&mut probe, c);
     let coalesce = matches!(rule, None | Some(Rule::Started));
     let plain = std::mem::take(&mut doc.pending_plain) && rule.is_none();
     doc.checkpoint(pos, coalesce, pos.block, pos.block);
@@ -159,7 +159,7 @@ fn fence_at(kind: &BlockKind, offset: usize) -> Option<(Option<String>, String)>
     Some((lang, body))
 }
 
-fn detect(kind: &BlockKind, c: usize) -> Option<Rule> {
+fn detect(kind: &mut BlockKind, c: usize) -> Option<Rule> {
     if let Some(rule) = block_rule(kind, c) {
         return Some(Rule::Block(rule));
     }
@@ -170,7 +170,16 @@ fn detect(kind: &BlockKind, c: usize) -> Option<Rule> {
         return None;
     }
     let (k, l) = slots::locate(&slots::slot_lens(kind), c)?;
-    let runs = slot_runs(kind, k)?;
+    let SlotMut::Runs(runs) = slots::slots_mut(kind).into_iter().nth(k)? else {
+        return None;
+    };
+    // Only `]`, `[`, `*`, `~` and `` ` `` can start a rule. Check the char
+    // before the caret first, so typing plain text does not copy the slot.
+    let before = runs.iter().flat_map(|r| r.text.chars()).nth(l.checked_sub(1)?)?;
+    if !matches!(before, ']' | '[' | '*' | '~' | '`') {
+        return None;
+    }
+    let runs: &[Run] = runs;
     let chars: Vec<char> = runs.iter().flat_map(|r| r.text.chars()).collect();
     let plain: Vec<bool> = runs
         .iter()
@@ -191,28 +200,53 @@ fn detect(kind: &BlockKind, c: usize) -> Option<Rule> {
 }
 
 /// Block-level rules, matched against the text before the cursor.
+/// Block rule for a paragraph whose first `c` chars are the typed text. Reads
+/// only as far as the rule can look, so a long paragraph is not copied.
+fn paragraph_rule(content: &[Run], c: usize) -> Option<BlockRule> {
+    let chars = || content.iter().flat_map(|r| r.text.chars());
+    if c <= 8 {
+        let prefix: String = chars().take(c).collect();
+        return prefix_rule(&prefix);
+    }
+    // Longer than any heading or list marker: only `<digits>. ` can match.
+    // The scan stops at the first non-digit.
+    let mut tail = String::new();
+    for (i, ch) in chars().take(c).enumerate() {
+        if i + 2 < c {
+            if !ch.is_ascii_digit() {
+                return None;
+            }
+        } else {
+            tail.push(ch);
+        }
+    }
+    (tail == ". ").then_some(BlockRule::Ordered)
+}
+
+/// The block rule for a paragraph prefix of at most 8 chars.
+fn prefix_rule(prefix: &str) -> Option<BlockRule> {
+    if let Some(hashes) = prefix.strip_suffix(' ')
+        && (1..=6).contains(&hashes.len())
+        && hashes.bytes().all(|b| b == b'#')
+    {
+        return Some(BlockRule::Heading(hashes.len() as u8));
+    }
+    match prefix {
+        "- " | "* " => Some(BlockRule::Bullet),
+        "- [ ] " => Some(BlockRule::Task(false)),
+        "- [x] " | "- [X] " => Some(BlockRule::Task(true)),
+        "> " => Some(BlockRule::Quote),
+        other => {
+            let digits = other.strip_suffix(". ")?;
+            (!digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+                .then_some(BlockRule::Ordered)
+        }
+    }
+}
+
 fn block_rule(kind: &BlockKind, c: usize) -> Option<BlockRule> {
     match kind {
-        BlockKind::Paragraph { .. } => {
-            let prefix: String = kind.visible_text().chars().take(c).collect();
-            if let Some(hashes) = prefix.strip_suffix(' ')
-                && (1..=6).contains(&hashes.len())
-                && hashes.bytes().all(|b| b == b'#')
-            {
-                return Some(BlockRule::Heading(hashes.len() as u8));
-            }
-            match prefix.as_str() {
-                "- " | "* " => Some(BlockRule::Bullet),
-                "- [ ] " => Some(BlockRule::Task(false)),
-                "- [x] " | "- [X] " => Some(BlockRule::Task(true)),
-                "> " => Some(BlockRule::Quote),
-                other => {
-                    let digits = other.strip_suffix(". ")?;
-                    (!digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
-                        .then_some(BlockRule::Ordered)
-                }
-            }
-        }
+        BlockKind::Paragraph { content } => paragraph_rule(content, c),
         BlockKind::List {
             ordered: false,
             items,
@@ -241,14 +275,6 @@ fn block_rule(kind: &BlockKind, c: usize) -> Option<BlockRule> {
 }
 
 /// Plain text run list of slot `k`, read-only.
-fn slot_runs(kind: &BlockKind, k: usize) -> Option<Vec<Run>> {
-    let mut copy = kind.clone();
-    match slots::slots_mut(&mut copy).into_iter().nth(k)? {
-        SlotMut::Runs(r) => Some(r.clone()),
-        _ => None,
-    }
-}
-
 /// `*x*`, `**x**`, `~~x~~`, or `` `x` `` closed by the last typed char.
 /// Underscore is not a rule: `_` appears in URLs and identifiers.
 fn inline_rule(chars: &[char], plain: &[bool], l: usize, k: usize) -> Option<InlineRule> {

@@ -112,7 +112,16 @@ impl Document {
 
     /// Length of `block`'s visible text, in chars. `None` if the index is invalid.
     pub fn visible_len(&self, block: usize) -> Option<usize> {
-        self.visible_text(block).map(|t| t.chars().count())
+        // Counted from the runs. Same result as `visible_text`, without copying
+        // the text. Edits call this on every keystroke.
+        let b = self.blocks.get(block)?;
+        Some(match &b.kind {
+            BlockKind::Opaque { .. } => b.source.chars().count(),
+            BlockKind::Paragraph { content } | BlockKind::Heading { content, .. } => {
+                runs::char_len(content)
+            }
+            kind => kind.visible_text().chars().count(),
+        })
     }
 
     /// True if any edit happened since parse or the last [`Document::mark_saved`].
