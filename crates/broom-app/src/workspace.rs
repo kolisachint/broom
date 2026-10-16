@@ -16,7 +16,7 @@
 //! - [ ] autosave and recovery wiring (`broom-fs::autosave`, `recovery`)
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use broom_config::{Settings, VimBindings, settings_path};
 use broom_core::Document;
@@ -27,7 +27,7 @@ use gpui_kit::*;
 use crate::dialogs::{Dialog, DialogEvent, DialogKind};
 use crate::editor::{Editor, EditorStyle, ViewMode};
 use crate::keys::Run;
-use crate::right_panel::{RightPanel, RightPanelEvent, backlink_rows};
+use crate::right_panel::{RightPanel, RightPanelEvent, SnippetCache, backlink_rows};
 use crate::safety::{Safety, read_stamped};
 use crate::status_bar::{self, SaveState, StatusInfo};
 use crate::tabs::{TabRef, Tabs, autosave_ids};
@@ -41,6 +41,10 @@ pub const RIGHT_WIDTH: f32 = 260.0;
 
 /// How often the root checks autosave, disk changes and drafts.
 const TICK: Duration = Duration::from_millis(250);
+
+/// Word count, outline and backlinks follow typing after this much quiet.
+/// The save state in the status bar does not wait.
+const PANEL_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub struct Workspace {
     /// Folder the app was started in.
@@ -74,6 +78,10 @@ pub struct Workspace {
     pub(crate) settings: Settings,
     safety: Safety,
     links: Option<LinkIndex>,
+    /// Backlink snippets, reused while the linking files are unchanged.
+    snippets: SnippetCache,
+    /// Last edit. Set when word count, outline and backlinks are stale.
+    panels_due: Option<Instant>,
     /// Drafts from an earlier session. The head is shown in the dialog.
     recovery_queue: Vec<RecoveryEntry>,
     _subs: Vec<Subscription>,
@@ -140,6 +148,8 @@ impl Workspace {
             settings,
             safety,
             links,
+            snippets: SnippetCache::default(),
+            panels_due: None,
             recovery_queue: Vec::new(),
             _subs: subs,
             dialog_sub: None,
@@ -171,13 +181,7 @@ impl Workspace {
 
     /// Recomputes the status bar text from the editor.
     pub fn refresh_status(&mut self, cx: &mut Context<Self>) {
-        let save = if self.conflict_open(cx) {
-            SaveState::Conflict
-        } else if self.center.as_ref().is_some_and(|e| e.read(cx).is_dirty()) {
-            SaveState::Unsaved
-        } else {
-            SaveState::Saved
-        };
+        let save = self.save_state(cx);
         self.status = match &self.center {
             Some(editor) => {
                 let ed = editor.read(cx);
@@ -199,6 +203,17 @@ impl Workspace {
             },
         };
         cx.notify();
+    }
+
+    /// Save state shown in the status bar. Cheap: no text is read.
+    fn save_state(&self, cx: &App) -> SaveState {
+        if self.conflict_open(cx) {
+            SaveState::Conflict
+        } else if self.center.as_ref().is_some_and(|e| e.read(cx).is_dirty()) {
+            SaveState::Unsaved
+        } else {
+            SaveState::Saved
+        }
     }
 
     /// Name shown in the status bar.
@@ -233,7 +248,8 @@ impl Workspace {
             .map(|s| s.to_string_lossy().into_owned());
         let rows = match (&self.links, stem) {
             (Some(index), Some(stem)) => {
-                guarded("backlinks", || backlink_rows(index, &stem)).unwrap_or_default()
+                guarded("backlinks", || backlink_rows(index, &stem, &mut self.snippets))
+                    .unwrap_or_default()
             }
             _ => Vec::new(),
         };
@@ -250,14 +266,16 @@ impl Workspace {
             .is_some_and(|d| matches!(d.read(cx).kind, DialogKind::Conflict { .. }))
     }
 
-    /// Editor edit: keep the save state, drafts and outline current.
+    /// Editor edit: keep the save state and drafts current now. Word count,
+    /// outline and backlinks wait for [`PANEL_DEBOUNCE`] of quiet (see `tick`).
     pub(crate) fn on_edited(&mut self, cx: &mut Context<Self>) {
         let dirty = self.center.as_ref().is_some_and(|e| e.read(cx).is_dirty());
         if dirty {
             self.safety.note_edit(self.path.as_deref());
         }
-        self.refresh_status(cx);
-        self.refresh_panels(cx);
+        self.status.save = self.save_state(cx);
+        self.panels_due = Some(Instant::now());
+        cx.notify();
     }
 
     /// Opens `path` as a tab (see [`Tabs::open`]). Deferred, because the tab
@@ -429,6 +447,11 @@ impl Workspace {
 
     /// Periodic work: autosave, disk changes, and recovery drafts.
     fn tick(&mut self, cx: &mut Context<Self>) {
+        if self.panels_due.is_some_and(|at| at.elapsed() >= PANEL_DEBOUNCE) {
+            self.panels_due = None;
+            self.refresh_status(cx);
+            self.refresh_panels(cx);
+        }
         if self.dialog.is_none()
             && let Some(conflict) = self.safety.poll_disk(self.path.as_deref())
         {

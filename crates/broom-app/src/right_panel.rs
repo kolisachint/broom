@@ -3,7 +3,10 @@
 //! Clicks do not move the editor. They emit [`RightPanelEvent`]s and the
 //! workspace acts on them.
 
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use broom_links::{Backlink, LinkIndex};
 use gpui_kit::*;
@@ -94,25 +97,68 @@ impl RightPanel {
     }
 }
 
-/// Builds backlink rows for the note named `target` (its file stem).
-/// Reads each linking file to find the line of the link.
-pub fn backlink_rows(index: &LinkIndex, target: &str) -> Vec<BacklinkRow> {
-    index
-        .backlinks(target)
-        .iter()
-        .map(|b| BacklinkRow {
-            path: b.source.clone(),
-            snippet: snippet_for(b),
-        })
-        .collect()
+/// Snippets of the linking files, kept while each file's mtime is unchanged.
+/// Reading a file for every backlink on every edit was the cost; now each
+/// linking file is read at most once per change to it.
+#[derive(Default)]
+pub struct SnippetCache {
+    files: HashMap<PathBuf, FileSnippets>,
 }
 
-/// The text of the line that holds the link, trimmed and shortened.
-/// `span` is a byte range. The file may have changed since the index was
-/// built, so the start is moved back to a char boundary.
-fn snippet_for(b: &Backlink) -> String {
-    let text = std::fs::read_to_string(&b.source).unwrap_or_default();
-    let mut start = b.span.start.min(text.len());
+/// Snippets of one linking file, keyed by the link's span start.
+struct FileSnippets {
+    mtime: Option<SystemTime>,
+    by_start: HashMap<usize, String>,
+}
+
+/// Builds backlink rows for the note named `target` (its file stem).
+/// Snippets come from `cache`: the linking files are read only when they
+/// changed (or when the index now has links the cache lacks).
+pub fn backlink_rows(
+    index: &LinkIndex,
+    target: &str,
+    cache: &mut SnippetCache,
+) -> Vec<BacklinkRow> {
+    let links = index.backlinks(target);
+    let mut rows = Vec::with_capacity(links.len());
+    // Backlinks are sorted by source, so each linking file is one group.
+    for group in links.chunk_by(|a, b| a.source == b.source) {
+        let source = &group[0].source;
+        let snippets = cache.file_snippets(source, group);
+        rows.extend(group.iter().map(|b| BacklinkRow {
+            path: b.source.clone(),
+            snippet: snippets.get(&b.span.start).cloned().unwrap_or_default(),
+        }));
+    }
+    rows
+}
+
+impl SnippetCache {
+    /// Snippets for the links in `group`, all from one file. Reads the file
+    /// only when its mtime changed or a link in `group` is not cached yet.
+    fn file_snippets(&mut self, source: &Path, group: &[Backlink]) -> &HashMap<usize, String> {
+        let mtime = fs::metadata(source).and_then(|m| m.modified()).ok();
+        let fresh = self.files.get(source).is_some_and(|e| {
+            e.mtime == mtime && group.iter().all(|b| e.by_start.contains_key(&b.span.start))
+        });
+        if !fresh {
+            let text = fs::read_to_string(source).unwrap_or_default();
+            let by_start = group
+                .iter()
+                .map(|b| (b.span.start, snippet_in(&text, b.span.start)))
+                .collect();
+            self.files
+                .insert(source.to_path_buf(), FileSnippets { mtime, by_start });
+        }
+        &self.files[source].by_start
+    }
+}
+
+/// The text of the line that holds a link at byte `start`, trimmed and
+/// shortened. The file may have changed since the index was built, so the
+/// start is moved back to a char boundary.
+fn snippet_in(text: &str, start: usize) -> String {
+    let mut start = start.min(text.len());
     while !text.is_char_boundary(start) {
         start -= 1;
     }
