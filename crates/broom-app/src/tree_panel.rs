@@ -608,7 +608,8 @@ impl TreeView {
             EntryKind::Dir => format!("{}/", row.name),
             EntryKind::File => row.name.clone(),
         };
-        let mut label = div()
+        // Name first, then the ↗ hint on the same line for files that open elsewhere.
+        let name_el = div()
             .flex_1()
             .min_w_0()
             .truncate()
@@ -618,6 +619,13 @@ impl TreeView {
                 FontWeight::NORMAL
             })
             .child(name);
+        let mut label = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .min_w_0()
+            .child(name_el);
         if !markdown {
             label = label.child(
                 div()
