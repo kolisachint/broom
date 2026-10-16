@@ -759,7 +759,11 @@ impl Editor {
         }
         let md = self.markdown();
         let state = cx.new(|cx| EditorState::new(window, cx));
-        state.update(cx, |s, cx| s.set_value(md, window, cx));
+        // No line numbers: their gutter paints a white box inside the page.
+        state.update(cx, |s, cx| {
+            s.set_line_number(false, window, cx);
+            s.set_value(md, window, cx);
+        });
         let sub = cx.subscribe_in(
             &state,
             window,
@@ -832,6 +836,7 @@ impl Editor {
         let src = b.source().to_string();
         let state = cx.new(|cx| EditorState::new(window, cx));
         state.update(cx, |s, cx| {
+            s.set_line_number(false, window, cx);
             s.set_value(src, window, cx);
             s.focus(window, cx);
         });
