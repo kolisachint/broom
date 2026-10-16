@@ -18,14 +18,13 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use broom_config::{Settings, VimBindings, settings_path};
-use broom_core::Document;
+use broom_config::{Command, Settings, VimBindings, settings_path};
 use broom_fs::{ConflictKind, RecoveryEntry};
 use broom_links::LinkIndex;
 use gpui_kit::*;
 
 use crate::dialogs::{Dialog, DialogEvent, DialogKind};
-use crate::editor::{Editor, EditorStyle, ViewMode};
+use crate::editor::{Editor, ViewMode};
 use crate::keys::Run;
 use crate::right_panel::{RightPanel, RightPanelEvent, backlink_rows};
 use crate::safety::{Safety, read_stamped};
@@ -38,6 +37,11 @@ use crate::zen;
 /// Pane widths in logical pixels.
 pub const LEFT_WIDTH: f32 = 240.0;
 pub const RIGHT_WIDTH: f32 = 260.0;
+
+/// Height of the title row, in logical pixels.
+pub const TITLE_BAR_HEIGHT: f32 = 36.0;
+/// Left inset of the title row, clear of the traffic lights.
+pub const TRAFFIC_LIGHT_INSET: f32 = 78.0;
 
 /// How often the root checks autosave, disk changes and drafts.
 const TICK: Duration = Duration::from_millis(250);
@@ -86,22 +90,9 @@ impl Workspace {
     /// `todo!()` stub shows as an empty pane and never stops the window.
     pub fn new(folder: PathBuf, cx: &mut Context<Self>) -> Workspace {
         let settings = load_settings();
-        let vim = crate::keys::load_keymap()
-            .map(|k| k.vim)
-            .unwrap_or_else(empty_vim_bindings);
 
-        let style = EditorStyle {
-            font_size: settings.font_size,
-            body: settings.body_font.clone(),
-            mono: settings.mono_font.clone(),
-        };
-        let center = guarded("editor", || {
-            let mut editor = Editor::new(Document::empty(), style, false, &vim);
-            editor.vim_enabled = settings.vim_enabled;
-            editor
-        })
-        .map(|editor| cx.new(|_| editor));
-
+        // No tab at start. The window opens on the empty state, or on the
+        // folder's start note (see `open_startup`).
         // Edits in the centre editor are watched by `Tabs`, one subscription per tab.
         let mut subs = Vec::new();
         let right_panel = cx.new(|_| RightPanel::new(settings.show_right_panel));
@@ -125,7 +116,7 @@ impl Workspace {
         let mut ws = Workspace {
             folder,
             left: None,
-            center,
+            center: None,
             right: Some(right_panel.clone().into()),
             right_panel: Some(right_panel),
             tabs: None,
@@ -146,10 +137,6 @@ impl Workspace {
             _ticker: Some(ticker),
         };
         crate::tree_panel::install(&mut ws, cx);
-        if let (Some(tabs), Some(editor)) = (ws.tabs.clone(), ws.center.clone()) {
-            let key = Safety::untitled_key();
-            tabs.update(cx, |tabs, cx| tabs.push_initial(editor, key, cx));
-        }
         ws.recovery_queue = ws.safety.recoverable();
         ws.show_next_recovery(cx);
         ws.refresh_status(cx);
@@ -264,6 +251,43 @@ impl Workspace {
     /// strip calls back into this workspace.
     pub fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.with_tabs(cx, move |tabs, cx| tabs.open(&path, true, cx));
+    }
+
+    /// Opens the folder's start note, if it has one: `index.md`, else
+    /// `README.md`. With neither, the window keeps the empty state.
+    pub fn open_startup(&mut self, cx: &mut Context<Self>) {
+        let start = ["index.md", "README.md"]
+            .iter()
+            .map(|name| self.folder.join(name))
+            .find(|path| path.is_file());
+        if let Some(path) = start {
+            self.open_file(path, cx);
+        }
+    }
+
+    /// Cmd+N: a new untitled tab with an empty buffer.
+    pub fn new_untitled(&mut self, cx: &mut Context<Self>) {
+        let key = Safety::untitled_key();
+        self.with_tabs(cx, move |tabs, cx| {
+            tabs.open_restored(None, &key, "", cx);
+        });
+    }
+
+    /// Window title and title-bar text: the file name, with `— edited` when
+    /// it has unsaved changes. With no tab open, the folder name.
+    fn title_text(&self, cx: &App) -> String {
+        if self.active_tab(cx).is_none() {
+            return self
+                .folder
+                .file_name()
+                .map_or_else(|| "broom".to_string(), |n| n.to_string_lossy().into_owned());
+        }
+        let dirty = self.center.as_ref().is_some_and(|e| e.read(cx).is_dirty());
+        if dirty {
+            format!("{} — edited", self.file_name())
+        } else {
+            self.file_name()
+        }
     }
 
     /// Runs `f` on the tab strip after this update. Tab changes call back
@@ -676,10 +700,99 @@ impl Workspace {
             .child(title.to_string())
     }
 
-    fn center_pane(&self) -> Div {
-        let body = match &self.center {
-            Some(editor) => editor.clone().into_any_element(),
-            None => "Editor unavailable: no document loaded.".into_any_element(),
+    /// Shown in the centre when no tab is open: the folder name, and the three
+    /// keys that start working in it.
+    fn empty_state(&self) -> Div {
+        let folder = self
+            .folder
+            .file_name()
+            .map_or_else(|| self.folder.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let hints = [
+            ("Cmd+P", "open file"),
+            ("Cmd+N", "new note"),
+            ("Ctrl+Shift+/", "shortcuts"),
+        ];
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .text_color(theme::color(theme::MUTED))
+            .child(
+                div()
+                    .text_size(px(22.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::color(theme::INK))
+                    .child(folder),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .child(self.folder.display().to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .mt_4()
+                    .children(hints.iter().map(|(keys, what)| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_3()
+                            .child(div().w(px(120.)).flex().justify_end().child(theme::keycap(*keys)))
+                            .child(div().child(*what))
+                    })),
+            )
+    }
+
+    /// The title row above the panes. A drag region; the traffic lights sit
+    /// in its left inset. Double-click zooms, as a native titlebar does.
+    fn title_bar(&self, cx: &App) -> Stateful<Div> {
+        div()
+            .id("title-bar")
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .w_full()
+            .h(px(TITLE_BAR_HEIGHT))
+            .pl(px(TRAFFIC_LIGHT_INSET))
+            .pr_3()
+            .bg(theme::color(theme::PANEL))
+            .border_b_1()
+            .border_color(theme::color(theme::RULE))
+            .text_sm()
+            .text_color(theme::color(theme::INK))
+            .window_control_area(WindowControlArea::Drag)
+            .on_click(|ev: &ClickEvent, window, _| {
+                if ev.click_count() >= 2 {
+                    window.titlebar_double_click();
+                }
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::BOLD)
+                    .child(self.title_text(cx)),
+            )
+    }
+
+    fn center_pane(&self, cx: &App) -> Div {
+        let body = if self.active_tab(cx).is_none() {
+            self.empty_state().into_any_element()
+        } else {
+            match &self.center {
+                Some(editor) => editor.clone().into_any_element(),
+                None => "Editor unavailable: no document loaded.".into_any_element(),
+            }
         };
         let mut pane = div().flex().flex_col().flex_1().min_w_0().h_full();
         if let Some(tabs) = &self.tabs {
@@ -702,6 +815,12 @@ impl Render for Workspace {
         if self.dialog.is_none() && self.overlay.is_none() && window.focused(cx).is_none() {
             cx.defer_in(window, |this, window, cx| this.focus_center(window, cx));
         }
+        // The window title and the close-button dot follow the open file.
+        let title = self.title_text(cx);
+        window.set_window_title(&title);
+        window.set_window_edited(
+            self.center.as_ref().is_some_and(|e| e.read(cx).is_dirty()),
+        );
         let right_visible = !self.zen
             && self
                 .right_panel
@@ -732,9 +851,11 @@ impl Render for Workspace {
             .bg(theme::color(theme::BG))
             .text_color(theme::color(theme::INK))
             .text_size(px(self.settings.font_size))
-            .on_action(cx.listener(|this, run: &Run, window, cx| {
-                this.dispatch(run.0, window, cx);
+            .on_action(cx.listener(|this, run: &Run, window, cx| match run.0 {
+                Command::NewUntitled => this.new_untitled(cx),
+                cmd => this.dispatch(cmd, window, cx),
             }))
+            .child(self.title_bar(cx))
             .child(
                 div()
                     .flex()
@@ -742,7 +863,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(left)
-                    .child(self.center_pane())
+                    .child(self.center_pane(cx))
                     .children(right),
             )
             .children((!self.zen).then(|| status_bar::bar(&self.status)))

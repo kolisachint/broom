@@ -579,32 +579,98 @@ impl Render for TreeView {
 impl TreeView {
     fn render_row(&self, row: &TreeRow, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected.as_ref() == Some(&row.path);
-        // Text glyphs carry folder state. Colour is not needed to read them.
-        let glyph = match (row.kind, row.expanded) {
-            (EntryKind::Dir, true) => "▾",
-            (EntryKind::Dir, false) => "▸",
-            (EntryKind::File, _) => " ",
+        // Non-markdown files open in another app. They read as secondary.
+        let markdown = row.kind == EntryKind::Dir || broom_fs::is_markdown(&row.path);
+        let text_color = if markdown {
+            theme::INK
+        } else {
+            theme::MUTED
+        };
+        // Folder state is a chevron icon, sized to the row. Files keep the
+        // same width so names line up.
+        let disclosure = match (row.kind, row.expanded) {
+            (EntryKind::Dir, true) => Some("icons/chevron-down.svg"),
+            (EntryKind::Dir, false) => Some("icons/chevron-right.svg"),
+            (EntryKind::File, _) => None,
+        };
+        let chevron = div().flex_none().w(px(14.)).h(px(14.));
+        let chevron = match disclosure {
+            Some(path) => chevron.child(
+                component::Icon::default()
+                    .path(path)
+                    .text_color(theme::color(theme::MUTED))
+                    .w(px(14.))
+                    .h(px(14.)),
+            ),
+            None => chevron,
         };
         let name = match row.kind {
             EntryKind::Dir => format!("{}/", row.name),
             EntryKind::File => row.name.clone(),
         };
-        let mut el = div()
+        // Name first, then the ↗ hint on the same line for files that open elsewhere.
+        let name_el = div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .font_weight(if selected {
+                FontWeight::BOLD
+            } else {
+                FontWeight::NORMAL
+            })
+            .child(name);
+        let mut label = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .min_w_0()
+            .child(name_el);
+        if !markdown {
+            label = label.child(
+                div()
+                    .flex_none()
+                    .pl_1()
+                    .text_sm()
+                    .text_color(theme::color(theme::MUTED))
+                    .child("↗"),
+            );
+        }
+        // Selection: a 3 px ink bar at the left edge, bold text, and the
+        // active fill. The bar is always reserved, so text never shifts.
+        let el = div()
             .id(SharedString::from(row.path.display().to_string()))
             .flex()
             .flex_row()
             .items_center()
             .gap_1()
-            .pl(px(4.0 + 14.0 * row.depth as f32))
+            .h(px(30.))
             .pr_2()
-            .py_0p5()
+            .border_l_3()
+            .border_color(theme::color(if selected {
+                theme::ACCENT
+            } else {
+                theme::PANEL
+            }))
+            .text_color(theme::color(text_color))
+            .bg(theme::color(if selected {
+                theme::ACTIVE
+            } else {
+                theme::PANEL
+            }))
             .cursor_pointer()
-            .child(div().w(px(10.)).child(if selected { "›" } else { " " }))
-            .child(div().w(px(12.)).child(glyph))
-            .child(div().min_w_0().child(name));
-        if selected {
-            el = el.bg(theme::color(theme::ACTIVE));
-        }
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_1()
+                    .min_w_0()
+                    .pl(px(4.0 + 14.0 * row.depth as f32))
+                    .child(chevron)
+                    .child(label),
+            );
         let path = row.path.clone();
         let kind = row.kind;
         el.on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {

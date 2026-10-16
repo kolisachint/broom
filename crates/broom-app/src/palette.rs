@@ -75,6 +75,71 @@ pub fn row_bg(selected: bool) -> Hsla {
     }
 }
 
+/// Top edge of an overlay card, in logical pixels from the window top.
+pub const OVERLAY_TOP: f32 = 80.0;
+/// Width of the palette, quick open, search, and cheatsheet cards.
+pub const OVERLAY_WIDTH: f32 = 640.0;
+
+/// Full-window scrim behind an overlay. Light, so the page stays readable.
+/// The card is centred at [`OVERLAY_TOP`].
+pub fn scrim(id: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .flex()
+        .justify_center()
+        .items_start()
+        .pt(px(OVERLAY_TOP))
+        .bg(theme::color(theme::BASE03).opacity(0.12))
+}
+
+/// The overlay card: cream, rounded, with a soft shadow and a hairline edge.
+pub fn card(width: f32) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .w(px(width))
+        .p_3()
+        .gap_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme::color(theme::RULE))
+        .bg(theme::color(theme::BG))
+        .shadow_md()
+        .text_color(theme::color(theme::INK))
+}
+
+/// Keycap chips for a key label such as `Cmd+Shift+P`. Chords separated by a
+/// space get a gap between them. `no key` is plain muted text.
+pub fn key_chips(keys: &str) -> Div {
+    if keys.is_empty() || keys == "no key" {
+        return div().text_sm().text_color(theme::color(theme::MUTED)).child(keys.to_string());
+    }
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .children(keys.split(' ').map(|chord| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_0p5()
+                .children(chord.split('+').map(|part| theme::keycap(part.to_string())))
+        }))
+}
+
+/// Splits a relative path label at its last `/`: `("notes/", "beta.md")`.
+/// The directory part is empty for a file at the root.
+pub fn split_dir(label: &str) -> (&str, &str) {
+    match label.rfind('/') {
+        Some(i) => label.split_at(i + 1),
+        None => ("", label),
+    }
+}
+
 /// Rows drawn at once. The list scrolls by moving the selection.
 const VISIBLE_ROWS: usize = 12;
 
@@ -115,6 +180,12 @@ pub fn command_label(cmd: Command) -> String {
 
 /// `Cmd+Shift+P`. Text, not symbols alone, so it reads at any zoom.
 pub fn chord_label(chord: &Chord) -> String {
+    // `?` is Shift+/ on a US layout. Name the keys the user presses.
+    let (shift, key) = if chord.key == "?" {
+        (true, "/".to_string())
+    } else {
+        (chord.shift, chord.key.clone())
+    };
     let mut parts = Vec::new();
     if chord.ctrl {
         parts.push("Ctrl".to_string());
@@ -122,15 +193,15 @@ pub fn chord_label(chord: &Chord) -> String {
     if chord.alt {
         parts.push("Alt".to_string());
     }
-    if chord.shift {
+    if shift {
         parts.push("Shift".to_string());
     }
     if chord.cmd {
         parts.push("Cmd".to_string());
     }
-    let key = match chord.key.len() {
-        1 => chord.key.to_uppercase(),
-        _ => chord.key.clone(),
+    let key = match key.len() {
+        1 => key.to_uppercase(),
+        _ => key,
     };
     parts.push(key);
     parts.join("+")
@@ -401,69 +472,108 @@ impl Render for Palette {
         } else {
             theme::INK
         };
+        let files = self.mode == PaletteMode::Files;
         let rows = self.visible_range().map(|row| {
             let item = &self.items[self.shown[row]];
-            let marker = if row == self.selected { "›  " } else { "   " };
+            let selected = row == self.selected;
+            let label = if files {
+                // The folder part is dimmed, so the file name leads.
+                let (dir, name) = split_dir(&item.label);
+                div()
+                    .flex()
+                    .flex_row()
+                    .min_w_0()
+                    .truncate()
+                    .child(
+                        div()
+                            .text_color(theme::color(theme::MUTED))
+                            .child(dir.to_string()),
+                    )
+                    .child(
+                        div()
+                            .font_weight(if selected {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child(name.to_string()),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .font_weight(if selected {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .child(item.label.clone())
+                    .into_any_element()
+            };
             div()
                 .flex()
                 .flex_row()
+                .items_center()
                 .justify_between()
                 .gap_4()
+                .h(px(30.))
                 .px_2()
-                .py_1()
-                .rounded_sm()
-                .bg(row_bg(row == self.selected))
-                .child(format!("{marker}{}", item.label))
-                .child(
-                    div()
-                        .text_color(theme::color(theme::MUTED))
-                        .child(item.detail.clone()),
-                )
+                .rounded_md()
+                .border_l_3()
+                .border_color(theme::color(if selected {
+                    theme::ACCENT
+                } else {
+                    theme::BG
+                }))
+                .bg(row_bg(selected))
+                .child(label)
+                .child(key_chips(&item.detail))
         });
         let empty = if self.shown.is_empty() {
-            Some(div().px_2().py_1().child("No matches"))
+            Some(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(theme::color(theme::MUTED))
+                    .child("No matches"),
+            )
         } else {
             None
         };
-
-        div()
-            .id("palette")
-            .absolute()
-            .inset_0()
+        let query_text = div()
             .flex()
-            .justify_center()
-            .items_start()
-            .pt(px(72.))
-            .bg(rgba(0x00000040))
+            .flex_row()
+            .items_center()
+            .h(px(36.))
+            .px_2()
+            .rounded_md()
+            .bg(theme::color(theme::PANEL))
+            .text_size(px(18.))
+            .text_color(theme::color(query_color))
+            .child(format!("{query}▏"));
+
+        scrim("palette")
             .track_focus(&self.focus)
             .key_context("Palette TextInput")
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w(px(640.))
-                    .p_4()
-                    .gap_2()
-                    .text_size(px(18.))
-                    .bg(theme::color(theme::PANEL))
-                    .border_1()
-                    .border_color(theme::color(theme::RULE))
-                    .rounded_md()
-                    .text_color(theme::color(theme::INK))
-                    .child(div().font_weight(FontWeight::BOLD).child(title))
+                card(OVERLAY_WIDTH)
                     .child(
                         div()
-                            .text_color(theme::color(query_color))
-                            .child(format!("{query}▏")),
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .items_baseline()
+                            .gap_4()
+                            .text_sm()
+                            .child(div().font_weight(FontWeight::BOLD).child(title))
+                            .child(
+                                div()
+                                    .text_color(theme::color(theme::MUTED))
+                                    .child(self.status.clone()),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .text_color(theme::color(theme::MUTED))
-                            .child(self.status.clone()),
-                    )
-                    .child(div().flex().flex_col().children(rows))
+                    .child(query_text)
+                    .child(div().flex().flex_col().gap_0p5().children(rows))
                     .children(empty),
             )
     }

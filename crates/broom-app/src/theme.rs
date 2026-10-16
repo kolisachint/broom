@@ -48,6 +48,25 @@ pub fn color(hex: u32) -> Hsla {
     rgb(hex).into()
 }
 
+/// Accent bar on the selected row or the active tab. Drawn with the bold
+/// weight, so the state never rests on colour alone.
+pub const ACCENT: u32 = BASE02;
+
+/// One key of a shortcut, drawn as a keycap chip. The text is the meaning.
+pub fn keycap(label: impl Into<SharedString>) -> Div {
+    div()
+        .px_1()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(color(RULE))
+        .bg(color(BG))
+        .text_color(color(INK))
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.into())
+}
+
 /// Caret width in pixels.
 pub const CARET_WIDTH: f32 = 3.0;
 
