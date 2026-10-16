@@ -431,21 +431,12 @@ impl Render for Tabs {
             .bg(theme::color(theme::PANEL))
             .text_color(theme::color(theme::INK));
 
-        if self.tabs.is_empty() {
-            strip = strip.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_color(theme::color(theme::MUTED))
-                    .child("No open tabs"),
-            );
-        }
-
         for (i, tab) in self.tabs.iter().enumerate() {
             let active = self.active == Some(i);
             let dirty = tab.editor.read(cx).is_dirty();
+            // `•` marks unsaved edits in the text itself.
             let label = if dirty {
-                format!("● {}", tab.title)
+                format!("• {}", tab.title)
             } else {
                 tab.title.to_string()
             };
@@ -455,17 +446,24 @@ impl Render for Tabs {
             } else {
                 div().italic().child(label)
             };
-            let mut el = div()
-                .id(("tab", i))
+            // Every tab keeps a 2 px top edge. Only the active one has ink in it.
+            // The active tab has a 2 px ink bar on top, bold text, and the
+            // page colour, so it reads as joined to the editor below.
+            let bar = div()
+                .h(px(2.))
+                .w_full()
+                .bg(theme::color(if active {
+                    theme::ACCENT
+                } else {
+                    theme::PANEL
+                }));
+            let row = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
                 .px_3()
-                .py_1()
-                .border_r_1()
-                .border_color(theme::color(theme::RULE))
-                .cursor_pointer()
+                .h(px(30.))
                 .child(title)
                 .child(
                     div()
@@ -476,7 +474,21 @@ impl Render for Tabs {
                             cx.stop_propagation();
                             this.close_at(i, cx);
                         })),
-                )
+                );
+            let mut el = div()
+                .id(("tab", i))
+                .flex()
+                .flex_col()
+                .border_r_1()
+                .border_color(theme::color(theme::RULE))
+                .text_color(theme::color(if active {
+                    theme::INK
+                } else {
+                    theme::MUTED
+                }))
+                .cursor_pointer()
+                .child(bar)
+                .child(row)
                 .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                     this.activate(i, cx);
                     if ev.click_count() >= 2 {
