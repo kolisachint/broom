@@ -54,14 +54,23 @@ pub const CARET_WIDTH: f32 = 3.0;
 /// Heading size multiplier for level 1..=6.
 pub fn heading_scale(level: u8) -> f32 {
     match level {
-        1 => 2.0,
-        2 => 1.6,
-        3 => 1.35,
-        4 => 1.18,
-        5 => 1.05,
+        1 => 1.9,
+        2 => 1.5,
+        3 => 1.25,
+        4 => 1.1,
         _ => 1.0,
     }
 }
+
+/// Body line height, as a multiple of the font size.
+pub const LINE_HEIGHT: f32 = 1.5;
+
+/// Space between blocks, in ems of the body size. Headings add their own
+/// space above, so they sit closer to what follows than to what precedes.
+pub const BLOCK_GAP: f32 = 0.75;
+
+/// Text column width in ems of the body size. About 72 digits wide.
+pub const MEASURE_EM: f32 = 43.0;
 
 /// Clamped zoom range in points.
 pub const ZOOM_MIN: f32 = 9.0;
