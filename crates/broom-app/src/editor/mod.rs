@@ -12,6 +12,7 @@ pub mod view;
 pub mod vim;
 
 use std::ops::Range;
+use std::time::Duration;
 
 use broom_config::{Command, VimBindings};
 use broom_core::{BlockKind, DocPos, DocRange, Document, InputRuleOutcome, StyleFlag};
@@ -21,6 +22,9 @@ use gpui_kit::*;
 
 use self::rows::{byte_index, char_index, heading_toggle};
 use self::vim::DocBuffer;
+
+/// Source edits re-parse the document once typing has paused this long.
+const SOURCE_PARSE_DELAY: Duration = Duration::from_millis(150);
 
 /// How the document is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +111,11 @@ pub struct Editor {
     pub reparsed: bool,
     /// Paints display math. See [`math`].
     pub math: math::MathPainter,
+    /// Source text that `doc` does not have yet. Set by source-mode edits,
+    /// cleared when the parse is applied. See [`Editor::sync_from_source`].
+    pending_md: Option<String>,
+    /// The debounced parse of `pending_md`. Dropping it cancels the parse.
+    source_sync: Option<Task<()>>,
     subs: Vec<Subscription>,
 }
 
@@ -136,13 +145,19 @@ impl Editor {
             wiki_sel: 0,
             reparsed: false,
             math: math::MathPainter::default(),
+            pending_md: None,
+            source_sync: None,
             subs: Vec::new(),
         }
     }
 
-    /// Full markdown of the document.
+    /// Full markdown of the document. While a source edit waits to be parsed,
+    /// this is the source text.
     pub fn markdown(&self) -> String {
-        self.doc.to_markdown()
+        match &self.pending_md {
+            Some(md) => md.clone(),
+            None => self.doc.to_markdown(),
+        }
     }
 
     /// True when the document differs from what was last saved.
@@ -224,6 +239,8 @@ impl Editor {
     /// Replaces the whole document from markdown. Used by source mode and by
     /// checkbox toggles, since the document has no per-block setter for them.
     pub fn replace_markdown(&mut self, md: &str, cx: &mut Context<Self>) {
+        self.pending_md = None;
+        self.source_sync = None;
         self.doc = Document::parse(md);
         self.reparsed = true;
         self.anchor = None;
@@ -562,6 +579,7 @@ impl Editor {
 
     /// Flips the checkbox of the `index`-th task in `block`.
     pub fn toggle_task(&mut self, block: usize, index: usize, cx: &mut Context<Self>) {
+        self.settle_source(cx);
         let Some(b) = self.doc.block(block) else {
             return;
         };
@@ -644,6 +662,7 @@ impl Editor {
 
     /// Runs an editor command. Returns false if this editor does not handle it.
     pub fn command(&mut self, cmd: Command, cx: &mut Context<Self>) -> bool {
+        self.settle_source(cx);
         match cmd {
             Command::Bold => self.style(StyleFlag::Bold, cx),
             Command::Italic => self.style(StyleFlag::Italic, cx),
@@ -673,6 +692,7 @@ impl Editor {
 
     /// Feeds one key to vim. Applies the outcome to the document and caret.
     pub fn vim_input(&mut self, ki: KeyInput, cx: &mut Context<Self>) -> VimOutcome {
+        self.settle_source(cx);
         let start = self
             .doc
             .pos_to_line(self.cursor)
@@ -770,15 +790,49 @@ impl Editor {
         self.subs.push(sub);
     }
 
-    /// Source text into the document, when it differs.
+    /// Source text into the document, when it differs. The parse waits until
+    /// typing pauses and runs off the UI thread. Until it lands, `markdown()`
+    /// returns the source text, so saves are current.
     fn sync_from_source(&mut self, cx: &mut Context<Self>) {
         let Some(state) = self.source.clone() else {
             return;
         };
         let text = state.read(cx).value().to_string();
-        if text != self.markdown() {
-            self.replace_markdown(&text, cx);
+        if text == self.markdown() {
+            return;
         }
+        self.reparsed = true;
+        self.pending_md = Some(text);
+        // Dropping the previous task cancels its parse: only the last pause counts.
+        self.source_sync = Some(cx.spawn(async move |this: WeakEntity<Editor>, cx| {
+            cx.background_executor().timer(SOURCE_PARSE_DELAY).await;
+            let Ok(Some(text)) = this.update(cx, |ed, _| ed.pending_md.clone()) else {
+                return;
+            };
+            let doc = cx.background_spawn(async move { Document::parse(&text) }).await;
+            let _ = this.update(cx, |ed, cx| ed.apply_source(doc, cx));
+        }));
+        cx.emit(EditorEvent::Edited);
+        cx.notify();
+    }
+
+    /// Installs the parse of pending source text. Emits `Edited`.
+    fn apply_source(&mut self, doc: Document, cx: &mut Context<Self>) {
+        self.pending_md = None;
+        self.doc = doc;
+        self.anchor = None;
+        self.clamp_cursor();
+        cx.emit(EditorEvent::Edited);
+        cx.notify();
+    }
+
+    /// Parses pending source text now. For callers that need the document at once.
+    fn settle_source(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.pending_md.take() else {
+            return;
+        };
+        self.source_sync = None;
+        self.apply_source(Document::parse(&text), cx);
     }
 
     pub fn set_mode(&mut self, mode: ViewMode, window: &mut Window, cx: &mut Context<Self>) {
@@ -801,6 +855,7 @@ impl Editor {
             }
             ViewMode::Formatted => {
                 self.sync_from_source(cx);
+                self.settle_source(cx);
                 self.mode = ViewMode::Formatted;
                 self.large_notice = false;
             }
@@ -823,6 +878,7 @@ impl Editor {
     // ----- opaque mini editor -----
 
     pub fn open_mini(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_source(cx);
         let Some(b) = self.doc.block(block) else {
             return;
         };
