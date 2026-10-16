@@ -129,7 +129,7 @@ fn section_el(title: &'static str, rows: &[Row]) -> Div {
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .h(px(30.))
+                .h(px(26.))
                 .px_1()
                 .child(div().min_w_0().truncate().child(row.name.clone()))
                 .child(key_chips(&row.keys))
