@@ -35,3 +35,15 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.9"
 tempfile = "3"
+
+# Dev builds: line tables instead of full debuginfo. Backtraces and stepping
+# by line still work. The app binary is ~270 MB with full debuginfo, and the
+# link step is part of every rebuild.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies (GPUI, gpui-component, typst, ...) are built with opt-level 1,
+# so dev runs are not sluggish. Workspace crates stay at opt-level 0 so that
+# incremental rebuilds stay fast. Each dependency builds once, then is cached.
+[profile.dev.package."*"]
+opt-level = 1
