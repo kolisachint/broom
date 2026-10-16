@@ -193,6 +193,11 @@ pub fn focus_editor(ws: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
 impl Workspace {
     /// Moves keyboard focus to the centre editor. Used when an overlay closes.
     pub fn focus_center(&self, window: &mut Window, cx: &mut Context<Self>) {
+        // Callers defer this. If an overlay or dialog opened in between, it
+        // owns the keyboard: stealing focus would type into the document.
+        if self.overlay.is_some() || self.dialog.is_some() {
+            return;
+        }
         let Some(editor) = self.center.clone() else {
             return;
         };
