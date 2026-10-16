@@ -19,7 +19,7 @@ use broom_vim::{Cursor, Key, KeyInput, Selection, Vim, VimOutcome};
 use gpui_kit::component::input::{EditorState, InputEvent};
 use gpui_kit::*;
 
-use self::rows::{byte_index, char_index, heading_toggle};
+use self::rows::{Shown, byte_index, char_index, heading_toggle};
 use self::vim::DocBuffer;
 
 /// How the document is shown.
@@ -60,7 +60,11 @@ pub struct EditorStyle {
 pub struct SegHandle {
     pub block: usize,
     pub start: usize,
+    /// Length in chars of the segment's own text.
+    pub len: usize,
+    /// The text as drawn. Its offsets map to own offsets through `shown`.
     pub text: SharedString,
+    pub shown: Shown,
     pub layout: TextLayout,
     pub links: Vec<(Range<usize>, LinkTarget)>,
 }
@@ -261,7 +265,7 @@ impl Editor {
         self.segs.iter().position(|s| {
             s.block == pos.block
                 && pos.offset >= s.start
-                && pos.offset <= s.start + s.text.chars().count()
+                && pos.offset <= s.start + s.len
         })
     }
 
@@ -293,7 +297,7 @@ impl Editor {
             return self.line_fallback(dir);
         };
         let seg = &self.segs[idx];
-        let off = self.cursor.offset - seg.start;
+        let off = seg.shown.to_drawn(self.cursor.offset - seg.start);
         let caret_byte = byte_index(&seg.text, off);
         let p = seg.layout.position_for_index(caret_byte)?;
         let lh = seg.layout.line_height();
@@ -305,7 +309,8 @@ impl Editor {
                 .layout
                 .index_for_position(point(x, ty))
                 .unwrap_or_else(|e| e);
-            return Some(DocPos::new(seg.block, seg.start + char_index(&seg.text, i)));
+            let c = seg.shown.to_own(char_index(&seg.text, i));
+            return Some(DocPos::new(seg.block, seg.start + c));
         }
         let j = idx as isize + dir as isize;
         if j < 0 || j as usize >= self.segs.len() {
@@ -322,10 +327,8 @@ impl Editor {
             .layout
             .index_for_position(point(x, ny))
             .unwrap_or_else(|e| e);
-        Some(DocPos::new(
-            next.block,
-            next.start + char_index(&next.text, i),
-        ))
+        let c = next.shown.to_own(char_index(&next.text, i));
+        Some(DocPos::new(next.block, next.start + c))
     }
 
     /// Up/down through the document's line view, used before layout exists.
@@ -363,7 +366,7 @@ impl Editor {
     pub fn move_line_edge(&mut self, end: bool, extend: bool) {
         self.pref_x = None;
         let pos = match self.seg_index(self.cursor).map(|i| &self.segs[i]) {
-            Some(seg) if end => DocPos::new(seg.block, seg.start + seg.text.chars().count()),
+            Some(seg) if end => DocPos::new(seg.block, seg.start + seg.len),
             Some(seg) => DocPos::new(seg.block, seg.start),
             None if end => DocPos::new(self.cursor.block, self.visible_len(self.cursor.block)),
             None => DocPos::new(self.cursor.block, 0),
@@ -756,7 +759,11 @@ impl Editor {
         }
         let md = self.markdown();
         let state = cx.new(|cx| EditorState::new(window, cx));
-        state.update(cx, |s, cx| s.set_value(md, window, cx));
+        // No line numbers: their gutter paints a white box inside the page.
+        state.update(cx, |s, cx| {
+            s.set_line_number(false, window, cx);
+            s.set_value(md, window, cx);
+        });
         let sub = cx.subscribe_in(
             &state,
             window,
@@ -829,6 +836,7 @@ impl Editor {
         let src = b.source().to_string();
         let state = cx.new(|cx| EditorState::new(window, cx));
         state.update(cx, |s, cx| {
+            s.set_line_number(false, window, cx);
             s.set_value(src, window, cx);
             s.focus(window, cx);
         });

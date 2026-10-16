@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use broom_math::{MathCache, MathError, MathImage};
+use broom_math::{DEFAULT_SCALE, MathCache, MathError, MathImage};
 use gpui_kit::*;
 use image::{Frame, RgbaImage};
 
@@ -24,11 +24,22 @@ type ImageKey = (String, bool, u32);
 /// A cached paint result: the image, or a note for the source fallback.
 type Painted = Result<Arc<RenderImage>, String>;
 
+/// An inline formula, sized in points at the 16 pt body size.
+#[derive(Clone)]
+pub struct InlineMath {
+    pub image: Arc<RenderImage>,
+    /// Size in points.
+    pub size: Size<Pixels>,
+    /// Distance in points from the top edge to the text baseline.
+    pub baseline: Pixels,
+}
+
 pub struct MathPainter {
     /// Window scale factor. The editor sets it at the start of each render.
     pub scale: f32,
     cache: MathCache,
     images: HashMap<ImageKey, Painted>,
+    inline: HashMap<String, Option<InlineMath>>,
 }
 
 impl Default for MathPainter {
@@ -37,6 +48,7 @@ impl Default for MathPainter {
             scale: 1.0,
             cache: MathCache::new(MAX_ENTRIES),
             images: HashMap::new(),
+            inline: HashMap::new(),
         }
     }
 }
@@ -45,6 +57,7 @@ impl MathPainter {
     /// Drops every cached image (font size or scale changed).
     pub fn clear(&mut self) {
         self.images.clear();
+        self.inline.clear();
         let _ = guarded("math cache", || self.cache.clear());
     }
 
@@ -65,6 +78,32 @@ impl MathPainter {
             None => Err(note_for(&MathError::Unsupported)),
         };
         self.images.insert(key, result.clone());
+        result
+    }
+
+    /// The inline formula for `tex`, or `None` when it cannot be rendered.
+    pub fn inline(&mut self, tex: &str) -> Option<InlineMath> {
+        if let Some(hit) = self.inline.get(tex) {
+            return hit.clone();
+        }
+        if self.inline.len() >= MAX_ENTRIES {
+            self.inline.clear();
+        }
+        let result = match guarded("math render", || self.cache.get_or_render(tex, false)) {
+            Some(Ok(math)) => to_render_image(&math).map(|image| {
+                let scale = DEFAULT_SCALE;
+                InlineMath {
+                    image,
+                    size: size(
+                        px(math.width as f32 / scale),
+                        px(math.height as f32 / scale),
+                    ),
+                    baseline: px(math.baseline / scale),
+                }
+            }),
+            _ => None,
+        };
+        self.inline.insert(tex.to_string(), result.clone());
         result
     }
 

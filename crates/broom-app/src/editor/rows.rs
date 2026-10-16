@@ -45,6 +45,117 @@ impl Seg {
     }
 }
 
+/// An inline math span drawn as an image over no-break spaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MathAt {
+    /// Char offset and length of the span in the segment's own text.
+    pub at: usize,
+    pub len: usize,
+    /// Char offset and length of the placeholder in the drawn text.
+    pub drawn: usize,
+    pub drawn_len: usize,
+}
+
+/// Maps char offsets between a segment's own text and the text drawn.
+/// Empty when nothing is drawn differently.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Shown {
+    pub maths: Vec<MathAt>,
+}
+
+impl Shown {
+    /// Drawn char offset of own offset `off`. Inside a math span, the start.
+    pub fn to_drawn(&self, off: usize) -> usize {
+        let mut delta: isize = 0;
+        for m in &self.maths {
+            if off < m.at {
+                break;
+            }
+            if off == m.at {
+                return m.drawn;
+            }
+            if off <= m.at + m.len {
+                return m.drawn + m.drawn_len;
+            }
+            delta = (m.drawn + m.drawn_len) as isize - (m.at + m.len) as isize;
+        }
+        (off as isize + delta) as usize
+    }
+
+    /// Own char offset of drawn offset `d`. Inside a placeholder, the nearer end.
+    pub fn to_own(&self, d: usize) -> usize {
+        let mut delta: isize = 0;
+        for m in &self.maths {
+            if d < m.drawn {
+                break;
+            }
+            if d == m.drawn {
+                return m.at;
+            }
+            if d <= m.drawn + m.drawn_len {
+                let near_start = (d - m.drawn) * 2 < m.drawn_len;
+                return if near_start { m.at } else { m.at + m.len };
+            }
+            delta = (m.drawn + m.drawn_len) as isize - (m.at + m.len) as isize;
+        }
+        (d as isize - delta) as usize
+    }
+}
+
+/// Builds the drawn form of `seg`: each math span becomes `pads[i]` no-break
+/// spaces, in span order. Returns the drawn segment and its map.
+pub fn drawn_seg(seg: &Seg, pads: &[usize]) -> (Seg, Shown) {
+    let mut text = String::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut maths = Vec::new();
+    let mut pads = pads.iter();
+    let (mut at, mut bytes, mut drawn) = (0, 0, 0);
+    for span in &seg.spans {
+        let part = &seg.text[bytes..bytes + span.len];
+        let n = part.chars().count();
+        if span.style.math
+            && let Some(&k) = pads.next()
+        {
+            let pad = "\u{a0}".repeat(k);
+            maths.push(MathAt {
+                at,
+                len: n,
+                drawn,
+                drawn_len: k,
+            });
+            push_span(&mut text, &mut spans, &pad, &SpanStyle::default());
+            drawn += k;
+        } else {
+            push_span(&mut text, &mut spans, part, &span.style);
+            drawn += n;
+        }
+        at += n;
+        bytes += span.len;
+    }
+    let out = Seg {
+        start: seg.start,
+        text,
+        spans,
+        align: seg.align,
+    };
+    (out, Shown { maths })
+}
+
+/// Appends `part` with `style`, merging into the last span if equal.
+fn push_span(text: &mut String, spans: &mut Vec<Span>, part: &str, style: &SpanStyle) {
+    if part.is_empty() {
+        return;
+    }
+    text.push_str(part);
+    match spans.last_mut() {
+        Some(last) if last.style == *style => last.len += part.len(),
+        _ => spans.push(Span {
+            len: part.len(),
+            style: style.clone(),
+        }),
+    }
+}
+
 /// Block-level look of a line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Deco {
