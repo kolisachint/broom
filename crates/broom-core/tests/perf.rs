@@ -63,17 +63,18 @@ fn perf_document_probes() {
     report("word_count (visible_text per block)", t, runs);
     println!("PERF words {n}");
 
-    // One-char edit in the middle of the document, then reserialize. This is
-    // the source-mode path too: `sync_from_source` re-parses the whole text.
+    // One-char edit in the middle of the document. Min of fresh documents, so
+    // machine load shows up as noise, not as the number.
     let mid = doc.block_count() / 2;
+    let mut best = f64::MAX;
     let mut edited = Document::parse(&src);
-    let t = Instant::now();
     for _ in 0..runs {
-        edited
-            .insert_typed(DocPos::new(mid, 0), "x")
-            .expect("insert");
+        edited = Document::parse(&src);
+        let t = Instant::now();
+        edited.insert_typed(DocPos::new(mid, 0), "x").expect("insert");
+        best = best.min(t.elapsed().as_secs_f64() * 1000.0);
     }
-    report("one-char insert_typed (Document)", t, runs);
+    println!("PERF {:<40} {:>10.3} ms (min of {runs})", "one-char insert_typed (Document)", best);
 
     let t = Instant::now();
     for _ in 0..runs {
