@@ -129,7 +129,7 @@ fn snippet_for(b: &Backlink) -> String {
 
 /// Visible text of one source line: emphasis, code marks, heading and list
 /// markers, `[[wiki]]` and `[text](url)` links are reduced to their text.
-fn strip_markdown(line: &str) -> String {
+pub(crate) fn strip_markdown(line: &str) -> String {
     let mut s = line.trim_start_matches('#').trim_start().to_string();
     for marker in ["- [ ] ", "- [x] ", "- ", "> "] {
         if let Some(rest) = s.strip_prefix(marker) {

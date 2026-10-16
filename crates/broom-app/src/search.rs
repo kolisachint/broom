@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::*;
 
-use crate::palette::row_bg;
+use crate::palette::{OVERLAY_WIDTH, card, row_bg, scrim};
+use crate::right_panel::strip_markdown;
 use crate::theme;
 use crate::workspace::Workspace;
 
@@ -133,6 +134,58 @@ pub fn format_hit(root: &Path, hit: &Hit) -> String {
     format!("{}:{}: {}", rel.display(), hit.line, hit.snippet)
 }
 
+/// Splits `text` into runs. Each run is `(text, is_match)`. Every
+/// case-insensitive occurrence of `query` is a match run. The match is
+/// shown bold, so it does not rely on colour.
+pub fn emphasis_spans(query: &str, text: &str) -> Vec<(String, bool)> {
+    let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let needle: Vec<char> = query.trim().chars().map(fold).collect();
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans: Vec<(String, bool)> = Vec::new();
+    if needle.is_empty() {
+        spans.push((text.to_string(), false));
+        return spans;
+    }
+    let mut plain = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let end = i + needle.len();
+        let hit = end <= chars.len()
+            && chars[i..end]
+                .iter()
+                .zip(&needle)
+                .all(|(&c, &n)| fold(c) == n);
+        if hit {
+            if !plain.is_empty() {
+                spans.push((std::mem::take(&mut plain), false));
+            }
+            spans.push((chars[i..end].iter().collect(), true));
+            i = end;
+        } else {
+            plain.push(chars[i]);
+            i += 1;
+        }
+    }
+    if !plain.is_empty() {
+        spans.push((plain, false));
+    }
+    spans
+}
+
+/// Path split for the result header: `(directory, file name)`. The directory
+/// is empty for a file at the root.
+fn header_parts(root: &Path, path: &Path) -> (String, String) {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let name = rel
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let dir = rel
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(String::new, |p| format!("{}/", p.display()));
+    (dir, name)
+}
+
 /// Overlay for folder search. Owns the query, the cached file list and hits.
 pub struct FolderSearch {
     root: PathBuf,
@@ -249,55 +302,123 @@ impl FolderSearch {
     }
 }
 
+/// One result: a header line (`notes/beta.md  line 3`), then the snippet
+/// with markdown marks removed and the match in bold. The snippet wraps
+/// under the header.
+fn result_row(root: &Path, hit: &Hit, query: &str, selected: bool) -> Div {
+    let (dir, name) = header_parts(root, &hit.path);
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_baseline()
+        .gap_2()
+        .text_sm()
+        .min_w_0()
+        .child(
+            div()
+                .text_color(theme::color(theme::MUTED))
+                .child(dir),
+        )
+        .child(div().font_weight(FontWeight::BOLD).child(name))
+        .child(
+            div()
+                .text_color(theme::color(theme::MUTED))
+                .child(format!("line {}", hit.line)),
+        );
+    let plain = strip_markdown(&hit.snippet);
+    // Runs are byte ranges into `plain`. Matches are bold, and the text wraps inline.
+    let mut offset = 0;
+    let mut bold = Vec::new();
+    for (text, is_match) in emphasis_spans(query, &plain) {
+        let end = offset + text.len();
+        if is_match {
+            let style = HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            };
+            bold.push((offset..end, style));
+        }
+        offset = end;
+    }
+    let snippet = div()
+        .w_full()
+        .child(StyledText::new(plain).with_highlights(bold));
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_l_3()
+        .border_color(theme::color(if selected {
+            theme::ACCENT
+        } else {
+            theme::BG
+        }))
+        .bg(row_bg(selected))
+        .child(header)
+        .child(snippet)
+}
+
 impl Render for FolderSearch {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus, cx);
         }
-        let rows = self.hits.iter().enumerate().map(|(i, hit)| {
-            let text = format_hit(&self.root, hit);
-            let marker = if i == self.selected { "›  " } else { "   " };
-            div()
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .bg(row_bg(i == self.selected))
-                .child(format!("{marker}{text}"))
-        });
-
-        div()
-            .id("folder-search")
-            .absolute()
-            .inset_0()
+        let rows = self
+            .hits
+            .iter()
+            .enumerate()
+            .map(|(i, hit)| result_row(&self.root, hit, &self.query, i == self.selected));
+        let query_text = div()
             .flex()
-            .justify_center()
-            .items_start()
-            .pt(px(72.))
-            .bg(rgba(0x00000040))
+            .flex_row()
+            .items_center()
+            .h(px(36.))
+            .px_2()
+            .rounded_md()
+            .bg(theme::color(theme::PANEL))
+            .text_size(px(18.))
+            .child(format!("{}▏", self.query));
+
+        scrim("folder-search")
             .track_focus(&self.focus)
             .key_context("FolderSearch TextInput")
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w(px(720.))
+                card(OVERLAY_WIDTH)
                     .max_h(px(520.))
-                    .p_4()
-                    .gap_2()
-                    .text_size(px(18.))
-                    .bg(theme::color(theme::PANEL))
-                    .border_1()
-                    .border_color(theme::color(theme::RULE))
-                    .rounded_md()
-                    .text_color(theme::color(theme::INK))
-                    .child(format!("Search folder: {}▏", self.query))
                     .child(
                         div()
-                            .text_color(theme::color(theme::MUTED))
-                            .child(self.status.clone()),
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .items_baseline()
+                            .gap_4()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Search folder"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme::color(theme::MUTED))
+                                    .child(self.status.clone()),
+                            ),
                     )
-                    .child(div().flex().flex_col().children(rows)),
+                    .child(query_text)
+                    .child(
+                        div()
+                            .id("search-hits")
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .children(rows),
+                    ),
             )
     }
 }
@@ -387,5 +508,34 @@ mod tests {
         let s = snippet(&format!("  {long}  "));
         assert_eq!(s.chars().count(), SNIPPET_CHARS + 1);
         assert_eq!(snippet("  hi  "), "hi");
+    }
+
+    #[test]
+    fn emphasis_marks_every_case_insensitive_match() {
+        assert_eq!(
+            emphasis_spans("world", "Hello WORLD, world!"),
+            vec![
+                ("Hello ".to_string(), false),
+                ("WORLD".to_string(), true),
+                (", ".to_string(), false),
+                ("world".to_string(), true),
+                ("!".to_string(), false),
+            ]
+        );
+        assert_eq!(emphasis_spans("zz", "abc"), vec![("abc".to_string(), false)]);
+        assert_eq!(emphasis_spans(" ", "abc"), vec![("abc".to_string(), false)]);
+    }
+
+    #[test]
+    fn header_shows_dir_and_name_separately() {
+        let root = Path::new("/n");
+        assert_eq!(
+            header_parts(root, Path::new("/n/notes/beta.md")),
+            ("notes/".to_string(), "beta.md".to_string())
+        );
+        assert_eq!(
+            header_parts(root, Path::new("/n/index.md")),
+            (String::new(), "index.md".to_string())
+        );
     }
 }

@@ -6,7 +6,7 @@
 use broom_config::Command;
 use gpui_kit::*;
 
-use crate::palette::{ALL, command_label, key_labels};
+use crate::palette::{ALL, card, command_label, key_chips, key_labels, scrim};
 use crate::theme;
 use crate::workspace::Workspace;
 
@@ -88,42 +88,73 @@ impl Cheatsheet {
     }
 }
 
+/// Index where the sections split into two columns. Each section costs its
+/// rows plus one for its heading. Picks the split closest to half the height.
+pub fn column_split(row_counts: &[usize]) -> usize {
+    let cost: Vec<usize> = row_counts.iter().map(|n| n + 1).collect();
+    let total: usize = cost.iter().sum();
+    let mut best = (usize::MAX, 0);
+    let mut acc: usize = 0;
+    for (i, c) in cost.iter().enumerate() {
+        let left: usize = acc;
+        let diff = left.abs_diff(total - left);
+        if diff < best.0 {
+            best = (diff, i);
+        }
+        acc += c;
+    }
+    best.1
+}
+
+/// One section: a heading, a hairline, then each command with its keys.
+fn section_el(title: &'static str, rows: &[Row]) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .font_weight(FontWeight::BOLD)
+                .text_sm()
+                .text_color(theme::color(theme::MUTED))
+                .pb_1()
+                .border_b_1()
+                .border_color(theme::color(theme::RULE))
+                .child(title),
+        )
+        .children(rows.iter().map(|row| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .h(px(30.))
+                .px_1()
+                .child(div().min_w_0().truncate().child(row.name.clone()))
+                .child(key_chips(&row.keys))
+        }))
+}
+
 impl Render for Cheatsheet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus, cx);
         }
-        let sections = self.sections.iter().map(|(title, rows)| {
+        let counts: Vec<usize> = self.sections.iter().map(|(_, rows)| rows.len()).collect();
+        let split = column_split(&counts);
+        let (left, right) = self.sections.split_at(split);
+        let column = |sections: &[(&'static str, Vec<Row>)]| {
             div()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .child(div().font_weight(FontWeight::BOLD).child(*title))
-                .children(rows.iter().map(|row| {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_between()
-                        .gap_4()
-                        .px_2()
-                        .child(row.name.clone())
-                        .child(
-                            div()
-                                .text_color(theme::color(theme::MUTED))
-                                .child(row.keys.clone()),
-                        )
-                }))
-        });
+                .flex_1()
+                .min_w_0()
+                .gap_4()
+                .children(sections.iter().map(|(title, rows)| section_el(*title, rows)))
+        };
 
-        div()
-            .id("cheatsheet")
-            .absolute()
-            .inset_0()
-            .flex()
-            .justify_center()
-            .items_start()
-            .pt(px(48.))
-            .bg(rgba(0x00000040))
+        scrim("cheatsheet")
             .track_focus(&self.focus)
             .key_context("Cheatsheet")
             .on_key_down(cx.listener(|_, ev: &KeyDownEvent, _, cx| {
@@ -132,42 +163,39 @@ impl Render for Cheatsheet {
                 }
             }))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w(px(720.))
-                    .max_h(px(620.))
-                    .p_4()
-                    .gap_3()
-                    .text_size(px(18.))
-                    .bg(theme::color(theme::PANEL))
-                    .border_1()
-                    .border_color(theme::color(theme::RULE))
-                    .rounded_md()
-                    .text_color(theme::color(theme::INK))
+                card(CARD_WIDTH)
+                    .max_h(px(CARD_MAX_HEIGHT))
                     .child(
                         div()
                             .font_weight(FontWeight::BOLD)
+                            .text_size(px(18.))
                             .child("Keyboard shortcuts"),
                     )
                     .child(
                         div()
                             .id("cheatsheet-list")
                             .flex()
-                            .flex_col()
-                            .gap_3()
+                            .flex_row()
+                            .gap_6()
+                            .min_h_0()
                             .overflow_y_scroll()
-                            .children(sections),
+                            .child(column(left))
+                            .child(column(right)),
                     )
                     .child(
                         div()
-                            .text_size(px(14.))
+                            .text_sm()
                             .text_color(theme::color(theme::MUTED))
                             .child("Escape closes this list."),
                     ),
             )
     }
 }
+
+/// Width of the cheatsheet card. Two columns fit inside it.
+const CARD_WIDTH: f32 = 760.0;
+/// Tallest the card grows before its columns scroll.
+const CARD_MAX_HEIGHT: f32 = 620.0;
 
 impl Workspace {
     /// Opens the cheatsheet over the workspace.
