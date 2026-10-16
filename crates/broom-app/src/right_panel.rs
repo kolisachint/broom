@@ -169,27 +169,36 @@ pub fn file_label(path: &Path) -> String {
 }
 
 impl RightPanel {
+    /// One segment of the panel switch. The active one is bold with a
+    /// heavy underline, so the state does not rest on colour.
     fn tab_button(&self, tab: PanelTab, label: &str, cx: &mut Context<Self>) -> Stateful<Div> {
         let active = self.tab == tab;
-        // Active tab has brackets as well as bold: no colour-only state.
-        let text = if active {
-            format!("[{label}]")
+        let underline = if active {
+            theme::color(theme::ACCENT)
         } else {
-            label.to_string()
+            transparent_black()
         };
         div()
             .id(label.to_string())
+            .flex_1()
+            .text_center()
             .px_2()
             .py_1()
-            .rounded_sm()
+            .border_b_2()
+            .border_color(underline)
             .cursor_pointer()
             .font_weight(if active {
                 FontWeight::BOLD
             } else {
                 FontWeight::NORMAL
             })
+            .text_color(theme::color(if active {
+                theme::INK
+            } else {
+                theme::MUTED
+            }))
             .hover(|d| d.bg(theme::color(theme::ACTIVE)))
-            .child(text)
+            .child(label.to_string())
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.set_tab(tab, cx);
             }))
@@ -213,7 +222,18 @@ impl RightPanel {
                     .truncate()
                     .cursor_pointer()
                     .hover(|d| d.bg(theme::color(theme::ACTIVE)))
-                    .child(format!("H{level}  {text}"))
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(22.))
+                            .text_sm()
+                            .text_color(theme::color(theme::MUTED))
+                            .child(format!("H{level}")),
+                    )
+                    .child(div().min_w_0().truncate().child(text.clone()))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                         cx.emit(RightPanelEvent::Jump(block));
                     }))
@@ -273,7 +293,9 @@ impl Render for RightPanel {
                 div()
                     .flex()
                     .flex_row()
-                    .gap_1()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(theme::color(theme::RULE))
                     .child(self.tab_button(PanelTab::Outline, "Outline", cx))
                     .child(self.tab_button(PanelTab::Backlinks, "Backlinks", cx)),
             )
