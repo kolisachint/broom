@@ -151,7 +151,7 @@ impl Render for Cheatsheet {
                 .flex_1()
                 .min_w_0()
                 .gap_4()
-                .children(sections.iter().map(|(title, rows)| section_el(*title, rows)))
+                .children(sections.iter().map(|(title, rows)| section_el(title, rows)))
         };
 
         scrim("cheatsheet")
