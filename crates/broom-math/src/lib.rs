@@ -42,7 +42,10 @@ pub const DEFAULT_SCALE: f32 = 2.0;
 /// math mode, so TeX text never becomes Typst source and cannot inject code.
 const TEMPLATE: &str = r#"
 #import sys: inputs
-#set page(width: auto, height: auto, margin: 0pt, fill: none)
+// Inline formulas get room above and below. Typst sizes the page to the
+// layout box, which leaves out limits and tall glyphs, so they would be cut.
+// 16 pt is one em: enough for `\\sum_{i=1}^n` with its limits.
+#set page(width: auto, height: auto, margin: if inputs.display { 0pt } else { (x: 1pt, y: 16pt) }, fill: none)
 #set text(size: 16pt, fill: black)
 #let body = eval(inputs.math, mode: "math")
 #if inputs.display [$ #body $] else [$#body$]
@@ -366,9 +369,10 @@ mod tests {
     fn renders_fraction_display() {
         let img = render_math(r"\frac{a}{b}", true).expect("fraction should render");
         assert_valid(&img);
-        // Display fractions are taller than a single line of text.
+        // Display fractions are taller than a single line of text. Inline
+        // images carry 16 pt of margin above and below (32 px each at 2x).
         let inline = render_math(r"\frac{a}{b}", false).expect("inline fraction");
-        assert!(img.height >= inline.height);
+        assert!(img.height + 64 >= inline.height);
     }
 
     #[test]
@@ -513,5 +517,26 @@ mod tests {
         assert!(cache.get_or_render("x^2", false).is_ok());
         assert!(cache.is_empty());
         assert_eq!(cache.bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    /// Inline `\sum` with limits is taller than the 16 pt body text. Its
+    /// ink must not be cut at the image edge, so the image has room for it.
+    #[test]
+    fn inline_sum_fits_its_image() {
+        let m = render_math_scaled(r"\sum_{i=1}^n i", false, 1.0).expect("renders");
+        assert!(m.width > 0);
+        assert!(m.height >= 16, "height {} is below the font size", m.height);
+        assert!(m.baseline > 0.0 && m.baseline < m.height as f32);
+        // Ink that reaches the top or bottom row would mean it was cut there.
+        let row_ink = |y: usize| {
+            (0..m.width as usize).any(|x| m.rgba[(y * m.width as usize + x) * 4 + 3] > 0)
+        };
+        assert!(!row_ink(0), "ink touches the top edge");
+        assert!(!row_ink(m.height as usize - 1), "ink touches the bottom edge");
     }
 }
